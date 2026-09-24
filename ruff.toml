@@ -1,0 +1,25 @@
+#:schema https://www.schemastore.org/ruff.json
+
+exclude = [
+  '.github',
+  '.vscode',
+  'netbox_circuit_maintenance/migrations',
+  '.hooks',
+]
+line-length = 120
+target-version = "py312"
+output-format = "github"
+fix = true
+
+[lint]
+extend-select = ["E", "W", "F", "I", "B", "C4", "UP", "DJ"]
+ignore = ["F403", "F405", "RUF012", "E501", "B008"]
+preview = true
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"netbox_circuit_maintenance/graphql/filters.py" = ["F821"]
+
+[format]
+quote-style = "single"
+line-ending = "lf"

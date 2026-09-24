@@ -45,25 +45,3 @@ netbox_circuit_maintenance = [
 	"static/**",
 	"locale/**/*.mo"
 ]
-
-[tool.ruff]
-line-length = 120
-target-version = "py312"
-
-[tool.ruff.lint]
-select = [
-	"E",
-	"W",
-	"F",
-	"I",
-	"B",
-	"C4",
-	"UP",
-]
-ignore = [
-	"E501",
-	"B008",
-]
-
-[tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401"]
