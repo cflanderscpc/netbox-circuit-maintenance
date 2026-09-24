@@ -1,0 +1,2 @@
+# Field lengths the notification handler truncates parser output to before saving
+MAX_MAINTENANCE_NAME_LENGTH = 100
