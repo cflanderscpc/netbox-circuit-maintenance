@@ -1,15 +1,36 @@
+import uuid
 from datetime import UTC, datetime, timedelta
 
-from core.models import ObjectType
+from circuits.models import Circuit, CircuitType, Provider
+from core.choices import ObjectChangeActionChoices
+from core.models import ObjectChange, ObjectType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms import modelform_factory
-from django.test import TestCase
+from django.test import RequestFactory, TestCase
+from netbox.context_managers import event_tracking
+from users.models import User
 
-from netbox_circuit_maintenance.choices import CircuitMaintenanceStatusChoices
-from netbox_circuit_maintenance.models import CircuitMaintenance
+from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
+from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
+
+# NetBox counterparts of the Nautobot feature flags (custom_validators -> custom_validation, webhooks -> event_rules),
+# plus the rest of the NetBoxModel feature set
+NETBOX_MODEL_FEATURES = {
+    'bookmarks',
+    'change_logging',
+    'cloning',
+    'custom_fields',
+    'custom_links',
+    'custom_validation',
+    'event_rules',
+    'export_templates',
+    'journaling',
+    'notifications',
+    'tags',
+}
 
 
 class CircuitMaintenanceTestCase(TestCase):
@@ -92,23 +113,154 @@ class CircuitMaintenanceTestCase(TestCase):
         self.assertIsNone(CircuitMaintenance().docs_url)
 
     def test_features(self):
-        # NetBox counterparts of the Nautobot feature flags (custom_validators -> custom_validation,
-        # webhooks -> event_rules), plus the rest of the NetBoxModel feature set
         features = set(ObjectType.objects.get_for_model(CircuitMaintenance).features)
 
-        self.assertLessEqual(
-            {
-                'bookmarks',
-                'change_logging',
-                'cloning',
-                'custom_fields',
-                'custom_links',
-                'custom_validation',
-                'event_rules',
-                'export_templates',
-                'journaling',
-                'notifications',
-                'tags',
-            },
-            features,
+        self.assertLessEqual(NETBOX_MODEL_FEATURES, features)
+
+
+class CircuitImpactTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        providers = (
+            Provider.objects.create(name='Provider 1', slug='provider-1'),
+            Provider.objects.create(name='Provider 2', slug='provider-2'),
         )
+        circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
+        cls.circuits = (
+            Circuit.objects.create(cid='CID-1', provider=providers[0], type=circuit_type),
+            Circuit.objects.create(cid='CID-2', provider=providers[1], type=circuit_type),
+            Circuit.objects.create(cid='CID-3', provider=providers[1], type=circuit_type),
+        )
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(
+                name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
+            ),
+        )
+
+    def test_default_impact(self):
+        # Ported from Nautobot: the same circuit in two maintenances, neither impact set
+        CircuitImpact.objects.bulk_create(
+            (
+                CircuitImpact(maintenance=self.maintenances[0], circuit=self.circuits[0]),
+                CircuitImpact(maintenance=self.maintenances[1], circuit=self.circuits[0]),
+            )
+        )
+
+        self.assertEqual(
+            list(CircuitImpact.objects.values_list('impact', flat=True)),
+            [CircuitImpactChoices.OUTAGE, CircuitImpactChoices.OUTAGE],
+        )
+
+    def test_impact_values(self):
+        # The handler stores parser output verbatim, so the values must match the maintnote standard exactly
+        self.assertEqual(
+            CircuitImpactChoices.values(),
+            ['NO-IMPACT', 'REDUCED-REDUNDANCY', 'DEGRADED', 'OUTAGE'],
+        )
+
+    def test_get_impact_color(self):
+        impact = CircuitImpact(maintenance=self.maintenances[0], circuit=self.circuits[0])
+
+        for value in CircuitImpactChoices.values():
+            impact.impact = value
+            self.assertTrue(impact.get_impact_color(), value)
+
+    def test_str(self):
+        impact = CircuitImpact(
+            maintenance=self.maintenances[0], circuit=self.circuits[0], impact=CircuitImpactChoices.REDUCED_REDUNDANCY
+        )
+
+        self.assertEqual(str(impact), 'Circuit CID-1 with impact Reduced redundancy')
+
+    def test_unique_maintenance_circuit(self):
+        CircuitImpact.objects.create(maintenance=self.maintenances[0], circuit=self.circuits[0])
+
+        with self.assertRaises(ValidationError) as cm:
+            CircuitImpact(
+                maintenance=self.maintenances[0], circuit=self.circuits[0], impact=CircuitImpactChoices.NO_IMPACT
+            ).full_clean()
+        self.assertEqual(
+            cm.exception.message_dict,
+            {NON_FIELD_ERRORS: ['Circuit impact with this Maintenance and Circuit already exists.']},
+        )
+
+    def test_ordering(self):
+        # Maintenance (by its start_time, not its pk), then impact value, then pk
+        later, earlier = (
+            CircuitMaintenance.objects.create(name='UT-TEST-9', start_time=START + timedelta(days=9), end_time=END),
+            CircuitMaintenance.objects.create(name='UT-TEST-0', start_time=START - timedelta(days=9), end_time=END),
+        )
+        impacts = (
+            CircuitImpact.objects.create(
+                maintenance=later, circuit=self.circuits[0], impact=CircuitImpactChoices.NO_IMPACT
+            ),
+            CircuitImpact.objects.create(maintenance=earlier, circuit=self.circuits[1]),
+            CircuitImpact.objects.create(
+                maintenance=earlier, circuit=self.circuits[2], impact=CircuitImpactChoices.DEGRADED
+            ),
+            CircuitImpact.objects.create(
+                maintenance=earlier, circuit=self.circuits[0], impact=CircuitImpactChoices.DEGRADED
+            ),
+        )
+
+        self.assertEqual(list(CircuitImpact.objects.all()), [impacts[2], impacts[3], impacts[1], impacts[0]])
+
+    def test_cascade_delete(self):
+        CircuitImpact.objects.create(maintenance=self.maintenances[0], circuit=self.circuits[0])
+        CircuitImpact.objects.create(maintenance=self.maintenances[0], circuit=self.circuits[1])
+        CircuitImpact.objects.create(maintenance=self.maintenances[1], circuit=self.circuits[1])
+
+        self.circuits[0].delete()
+        self.assertEqual(CircuitImpact.objects.count(), 2)
+
+        self.maintenances[0].delete()
+        self.assertEqual(list(CircuitImpact.objects.values_list('circuit__cid', flat=True)), ['CID-2'])
+
+    def test_changelog_related_object(self):
+        # Impact changes show in the maintenance's changelog. Deletes can't be covered until the REST serializer
+        # exists: under event tracking NetBox serializes a deleted object for events straight away, and without a
+        # serializer that raises SerializerNotFound.
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = User.objects.create_user(username='user1')
+        maintenance = self.maintenances[0]
+
+        with event_tracking(request):
+            impact = CircuitImpact.objects.create(maintenance=maintenance, circuit=self.circuits[0])
+        with event_tracking(request):
+            impact.snapshot()
+            impact.impact = CircuitImpactChoices.NO_IMPACT
+            impact.save()
+
+        changes = ObjectChange.objects.filter(
+            changed_object_type=ObjectType.objects.get_for_model(CircuitImpact), changed_object_id=impact.pk
+        ).order_by('pk')
+        self.assertEqual(
+            [(change.action, change.related_object_type.model, change.related_object_id) for change in changes],
+            [
+                (ObjectChangeActionChoices.ACTION_CREATE, 'circuitmaintenance', maintenance.pk),
+                (ObjectChangeActionChoices.ACTION_UPDATE, 'circuitmaintenance', maintenance.pk),
+            ],
+        )
+
+    def test_maintenance_circuits_and_providers(self):
+        for circuit in self.circuits:
+            CircuitImpact.objects.create(maintenance=self.maintenances[0], circuit=circuit)
+        CircuitImpact.objects.create(maintenance=self.maintenances[1], circuit=self.circuits[0])
+
+        self.assertQuerySetEqual(self.maintenances[0].circuits, self.circuits, ordered=False)
+        # Provider 2 has two impacted circuits but is listed once
+        self.assertEqual(
+            list(self.maintenances[0].providers.values_list('name', flat=True)), ['Provider 1', 'Provider 2']
+        )
+        self.assertQuerySetEqual(self.maintenances[1].circuits, [self.circuits[0]])
+        self.assertEqual(list(self.maintenances[1].providers.values_list('name', flat=True)), ['Provider 1'])
+
+    def test_docs_url(self):
+        self.assertIsNone(CircuitImpact().docs_url)
+
+    def test_features(self):
+        features = set(ObjectType.objects.get_for_model(CircuitImpact).features)
+
+        self.assertLessEqual(NETBOX_MODEL_FEATURES, features)

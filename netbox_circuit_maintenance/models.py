@@ -1,12 +1,16 @@
+from circuits.models import Circuit, Provider
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.translation import gettext_lazy as _
-from netbox.models import PrimaryModel
+from netbox.models import NetBoxModel, PrimaryModel
 
-from .choices import CircuitMaintenanceStatusChoices
+from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
 from .constants import MAX_MAINTENANCE_NAME_LENGTH
 
-__all__ = ('CircuitMaintenance',)
+__all__ = (
+    'CircuitImpact',
+    'CircuitMaintenance',
+)
 
 
 class CircuitMaintenance(PrimaryModel):
@@ -56,6 +60,15 @@ class CircuitMaintenance(PrimaryModel):
         # The inherited URL points at a NetBox core docs page that doesn't exist; None hides the edit form's Help button
         return None
 
+    @property
+    def circuits(self):
+        return Circuit.objects.filter(maintenance_impacts__maintenance=self)
+
+    @property
+    def providers(self):
+        # distinct(): the join yields a provider once per impacted circuit
+        return Provider.objects.filter(circuits__maintenance_impacts__maintenance=self).distinct()
+
     def get_status_color(self):
         return CircuitMaintenanceStatusChoices.colors.get(self.status)
 
@@ -66,3 +79,57 @@ class CircuitMaintenance(PrimaryModel):
         # non-field: a CSV update row without an end_time column has no end_time form field to attach it to.
         if self.start_time and self.end_time and self.end_time < self.start_time:
             raise ValidationError(_('End time should be greater than start time.'))
+
+
+class CircuitImpact(NetBoxModel):
+    """
+    How a CircuitMaintenance affects one Circuit. A maintenance lists each circuit at most once.
+    """
+
+    maintenance = models.ForeignKey(
+        to='netbox_circuit_maintenance.CircuitMaintenance',
+        on_delete=models.CASCADE,
+        related_name='impacts',
+        verbose_name=_('maintenance'),
+    )
+    circuit = models.ForeignKey(
+        to='circuits.Circuit',
+        on_delete=models.CASCADE,
+        related_name='maintenance_impacts',
+        verbose_name=_('circuit'),
+    )
+    impact = models.CharField(
+        verbose_name=_('impact'),
+        max_length=50,
+        choices=CircuitImpactChoices,
+        default=CircuitImpactChoices.OUTAGE,
+    )
+
+    class Meta:
+        ordering = ['maintenance', 'impact', 'pk']
+        constraints = (
+            models.UniqueConstraint(
+                fields=('maintenance', 'circuit'),
+                name='%(app_label)s_%(class)s_unique_maintenance_circuit',
+            ),
+        )
+        indexes = (models.Index(fields=('maintenance', 'impact', 'id')),)  # Default ordering
+        verbose_name = _('circuit impact')
+        verbose_name_plural = _('circuit impacts')
+
+    def __str__(self):
+        return f'Circuit {self.circuit} with impact {self.get_impact_display()}'
+
+    @property
+    def docs_url(self):
+        # Same as CircuitMaintenance.docs_url
+        return None
+
+    def get_impact_color(self):
+        return CircuitImpactChoices.colors.get(self.impact)
+
+    def to_objectchange(self, action):
+        # List impact changes in the maintenance's changelog
+        objectchange = super().to_objectchange(action)
+        objectchange.related_object = self.maintenance
+        return objectchange

@@ -27,3 +27,22 @@ class CircuitMaintenanceStatusChoices(ChoiceSet):
         (RE_SCHEDULED, _('Re-scheduled'), 'purple'),
         (UNKNOWN, _('Unknown'), 'yellow'),
     )
+
+
+#
+# CircuitImpact
+#
+
+
+class CircuitImpactChoices(ChoiceSet):
+    NO_IMPACT = 'NO-IMPACT'
+    REDUCED_REDUNDANCY = 'REDUCED-REDUNDANCY'
+    DEGRADED = 'DEGRADED'
+    OUTAGE = 'OUTAGE'
+
+    CHOICES = (
+        (NO_IMPACT, _('No impact'), 'green'),
+        (REDUCED_REDUNDANCY, _('Reduced redundancy'), 'yellow'),
+        (DEGRADED, _('Degraded'), 'orange'),
+        (OUTAGE, _('Outage'), 'red'),
+    )

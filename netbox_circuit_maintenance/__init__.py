@@ -7,7 +7,7 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
     description = 'Manage circuit maintenance notifications in NetBox'
     version = '0.1.0'
     base_url = 'circuit-maint'
-    min_version = '4.6.0'
+    min_version = '4.6.6'
     max_version = '4.6.99'
 
 
