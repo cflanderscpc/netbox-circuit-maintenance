@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -7,12 +8,14 @@ from core.models import ObjectChange, ObjectType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms import modelform_factory
 from django.test import RequestFactory, TestCase
+from extras.models import ExportTemplate
+from google.oauth2.credentials import Credentials
 from netbox.context_managers import event_tracking
 from users.models import User
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
 from netbox_circuit_maintenance.constants import MAX_NOTE_TITLE_LENGTH
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note
+from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note, NotificationSource
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -379,5 +382,144 @@ class NoteTestCase(TestCase):
 
     def test_features(self):
         features = set(ObjectType.objects.get_for_model(Note).features)
+
+        self.assertLessEqual(NETBOX_MODEL_FEATURES, features)
+
+
+class NotificationSourceTestCase(TestCase):
+    # google-auth keeps expiry as a naive UTC datetime
+    TOKEN_EXPIRY = datetime(2030, 1, 1)  # noqa: DTZ001
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider.objects.create(name='Provider 1', slug='provider-1'),
+            Provider.objects.create(name='Provider 2', slug='provider-2'),
+        )
+        # What the OAuth callback will store: google.oauth2.credentials.Credentials.to_json()
+        cls.token = json.loads(
+            Credentials(
+                token='access-token',
+                refresh_token='refresh-token',
+                token_uri='https://oauth2.googleapis.com/token',
+                client_id='client-id',
+                client_secret='client-secret',
+                scopes=['https://www.googleapis.com/auth/gmail.readonly'],
+                expiry=cls.TOKEN_EXPIRY,
+            ).to_json()
+        )
+
+    def test_defaults(self):
+        source = NotificationSource(name='Source 1')
+        source.full_clean()
+        source.save()
+
+        self.assertFalse(source.attach_all_providers)
+        self.assertIsNone(source._token)
+        self.assertFalse(source.providers.exists())
+        self.assertEqual(str(source), 'Source 1')
+
+    def test_unique_name(self):
+        NotificationSource.objects.create(name='Source 1')
+
+        with self.assertRaises(ValidationError) as cm:
+            NotificationSource(name='Source 1').full_clean()
+        self.assertEqual(list(cm.exception.message_dict), ['name'])
+
+    def test_ordering(self):
+        for name in ('Source B', 'Source C', 'Source A'):
+            NotificationSource.objects.create(name=name)
+
+        self.assertEqual(
+            list(NotificationSource.objects.values_list('name', flat=True)), ['Source A', 'Source B', 'Source C']
+        )
+
+    def test_providers(self):
+        sources = (
+            NotificationSource.objects.create(name='Source 1'),
+            NotificationSource.objects.create(name='Source 2'),
+        )
+        sources[0].providers.set(self.providers)
+        sources[1].providers.add(self.providers[1])
+
+        self.assertQuerySetEqual(sources[0].providers.all(), self.providers)
+        self.assertQuerySetEqual(self.providers[0].maintenance_notification_sources.all(), [sources[0]])
+        self.assertQuerySetEqual(self.providers[1].maintenance_notification_sources.all(), sources)
+
+    def test_token_round_trip(self):
+        NotificationSource.objects.create(name='Source 1', _token=self.token)
+
+        credentials = Credentials.from_authorized_user_info(NotificationSource.objects.get(name='Source 1')._token)
+        self.assertEqual(
+            (credentials.token, credentials.refresh_token, credentials.client_secret, credentials.expiry),
+            ('access-token', 'refresh-token', 'client-secret', self.TOKEN_EXPIRY),
+        )
+
+    def test_token_not_editable(self):
+        form_class = modelform_factory(NotificationSource, fields='__all__')
+
+        self.assertNotIn('_token', form_class.base_fields)
+
+    def test_serialize_object_excludes_token(self):
+        source = NotificationSource.objects.create(name='Source 1', _token=self.token)
+
+        self.assertNotIn('_token', source.serialize_object())
+        self.assertNotIn('_token', source.serialize_object(exclude=['last_updated']))
+        self.assertEqual(source.serialize_object(exclude=['last_updated'])['name'], 'Source 1')
+
+    def test_changelog(self):
+        # Deleting a provider removes it from the source, which NetBox records as an update to the source. The source
+        # has no REST serializer yet, but update events serialize lazily, so the delete works under event tracking.
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = User.objects.create_user(username='user1')
+        provider_pks = [provider.pk for provider in self.providers]
+
+        with event_tracking(request):
+            source = NotificationSource.objects.create(name='Source 1', _token=self.token)
+            source.providers.set(self.providers)
+        request.id = uuid.uuid4()
+        with event_tracking(request):
+            self.providers[0].delete()
+
+        changes = ObjectChange.objects.filter(
+            changed_object_type=ObjectType.objects.get_for_model(NotificationSource), changed_object_id=source.pk
+        ).order_by('pk')
+        self.assertEqual(
+            [
+                (
+                    change.action,
+                    change.prechange_data and change.prechange_data['providers'],
+                    change.postchange_data['providers'],
+                )
+                for change in changes
+            ],
+            [
+                (ObjectChangeActionChoices.ACTION_CREATE, None, provider_pks),
+                (ObjectChangeActionChoices.ACTION_UPDATE, provider_pks, provider_pks[1:]),
+            ],
+        )
+        for change in changes:
+            self.assertNotIn('_token', change.prechange_data or {})
+            self.assertNotIn('_token', change.postchange_data)
+        source.refresh_from_db()
+        self.assertEqual(source._token, self.token)
+
+    def test_export_template_token_attribute(self):
+        # The Jinja2 sandbox blocks underscore attributes. ORM methods such as values_list('_token') still reach the
+        # token: export template authors are trusted, as they can read any row in NetBox that way
+        NotificationSource.objects.create(name='Source 1', _token=self.token)
+        export_template = ExportTemplate(
+            name='Sources',
+            template_code='{% for source in queryset %}{{ source.name }}:{{ source._token }};{% endfor %}',
+        )
+
+        self.assertEqual(export_template.render(queryset=NotificationSource.objects.all()), 'Source 1:;')
+
+    def test_docs_url(self):
+        self.assertIsNone(NotificationSource().docs_url)
+
+    def test_features(self):
+        features = set(ObjectType.objects.get_for_model(NotificationSource).features)
 
         self.assertLessEqual(NETBOX_MODEL_FEATURES, features)

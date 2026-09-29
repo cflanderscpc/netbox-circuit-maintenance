@@ -11,6 +11,7 @@ __all__ = (
     'CircuitImpact',
     'CircuitMaintenance',
     'Note',
+    'NotificationSource',
 )
 
 
@@ -190,3 +191,55 @@ class Note(NetBoxModel):
         objectchange = super().to_objectchange(action)
         objectchange.related_object = self.maintenance
         return objectchange
+
+
+class NotificationSource(NetBoxModel):
+    """
+    A mailbox or API that the notification handler fetches notifications from. Rows mirror the notification_sources
+    in PLUGINS_CONFIG, matched by name; users only choose which providers each source applies to.
+    """
+
+    name = models.CharField(
+        verbose_name=_('name'),
+        max_length=100,
+        unique=True,
+        help_text=_('Notification source name as defined in the plugin configuration'),
+    )
+    providers = models.ManyToManyField(
+        to='circuits.Provider',
+        related_name='maintenance_notification_sources',
+        blank=True,
+        verbose_name=_('providers'),
+        help_text=_('The providers that this notification source applies to'),
+    )
+    # Google OAuth credentials as authorized-user info (google.oauth2.credentials.Credentials.to_json()), None until
+    # authorized. Holds a refresh token and client secret, so it stays out of serialize_object() and forms and has no
+    # public property. The Jinja2 sandbox hides underscore attributes from export templates and custom links, but their
+    # authors (trusted, per NetBox's docs) can still reach it through ORM methods such as values_list().
+    _token = models.JSONField(
+        blank=True,
+        null=True,
+        editable=False,
+    )
+    attach_all_providers = models.BooleanField(
+        verbose_name=_('attach all providers'),
+        default=False,
+        help_text=_('Attach all the providers to this notification source'),
+    )
+
+    class Meta:
+        ordering = ['name']
+        verbose_name = _('notification source')
+        verbose_name_plural = _('notification sources')
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def docs_url(self):
+        # Same as CircuitMaintenance.docs_url
+        return None
+
+    def serialize_object(self, exclude=None):
+        # Keep the OAuth token out of change records and event rule snapshots
+        return super().serialize_object(exclude=[*(exclude or []), '_token'])
