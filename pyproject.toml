@@ -31,6 +31,18 @@ classifiers = [
 	"Programming Language :: Python :: 3.14",
 	"Topic :: System :: Networking",
 ]
+dependencies = [
+  'pydantic >= 2.13',
+  'circuit-maintenance-parser >= 2.12.0',
+  'google-api-python-client',
+  'google-auth[requests]',
+  'google-auth-oauthlib'
+]
+
+[project.optional-dependencies]
+m365 = [
+  'msgraph-sdk'
+]
 
 [tool.setuptools]
 include-package-data = true
