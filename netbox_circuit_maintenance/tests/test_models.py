@@ -10,8 +10,9 @@ from django.test import RequestFactory, TestCase
 from netbox.context_managers import event_tracking
 from users.models import User
 
-from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance
+from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.constants import MAX_NOTE_TITLE_LENGTH
+from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -262,5 +263,121 @@ class CircuitImpactTestCase(TestCase):
 
     def test_features(self):
         features = set(ObjectType.objects.get_for_model(CircuitImpact).features)
+
+        self.assertLessEqual(NETBOX_MODEL_FEATURES, features)
+
+
+class NoteTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(
+                name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
+            ),
+        )
+
+    def test_defaults(self):
+        note = Note.objects.create(maintenance=self.maintenances[0], title='Note 1', comment='comment 1')
+
+        self.assertEqual(note.level, NoteLevelChoices.INFO)
+        self.assertEqual(str(note), 'Note 1')
+
+    def test_level_values(self):
+        # The handler creates notes with level 'WARNING'
+        self.assertEqual(NoteLevelChoices.values(), ['INFO', 'WARNING'])
+
+    def test_get_level_color(self):
+        note = Note(maintenance=self.maintenances[0], title='Note 1', comment='comment 1')
+
+        for level in NoteLevelChoices.values():
+            note.level = level
+            self.assertTrue(note.get_level_color(), level)
+
+    def test_required_fields(self):
+        with self.assertRaises(ValidationError) as cm:
+            Note(maintenance=self.maintenances[0]).full_clean()
+        self.assertEqual(sorted(cm.exception.message_dict), ['comment', 'title'])
+
+    def test_title_max_length(self):
+        # The handler truncates titles to MAX_NOTE_TITLE_LENGTH
+        Note(maintenance=self.maintenances[0], title='x' * MAX_NOTE_TITLE_LENGTH, comment='comment 1').full_clean()
+
+        with self.assertRaises(ValidationError) as cm:
+            Note(
+                maintenance=self.maintenances[0], title='x' * (MAX_NOTE_TITLE_LENGTH + 1), comment='comment 1'
+            ).full_clean()
+        self.assertEqual(list(cm.exception.message_dict), ['title'])
+
+    def test_unique_maintenance_title(self):
+        Note.objects.create(maintenance=self.maintenances[0], title='Note 1', comment='comment 1')
+
+        with self.assertRaises(ValidationError) as cm:
+            Note(
+                maintenance=self.maintenances[0],
+                title='Note 1',
+                level=NoteLevelChoices.WARNING,
+                comment='comment 2',
+            ).full_clean()
+        self.assertEqual(
+            cm.exception.message_dict,
+            {NON_FIELD_ERRORS: ['Note with this Maintenance and Title already exists.']},
+        )
+
+        # The same title on another maintenance is fine
+        Note(maintenance=self.maintenances[1], title='Note 1', comment='comment 1').full_clean()
+
+    def test_ordering(self):
+        # Least recently updated first, then pk, so editing a note moves it to the end
+        notes = [
+            Note.objects.create(maintenance=self.maintenances[0], title=f'Note {i}', comment=f'comment {i}')
+            for i in range(3)
+        ]
+        Note.objects.filter(pk=notes[0].pk).update(last_updated=START + timedelta(days=1))
+        Note.objects.filter(pk__in=(notes[1].pk, notes[2].pk)).update(last_updated=START)
+        self.assertEqual(list(Note.objects.all()), [notes[1], notes[2], notes[0]])
+
+        notes[1].save()
+        self.assertEqual(list(Note.objects.all()), [notes[2], notes[0], notes[1]])
+
+    def test_cascade_delete(self):
+        Note.objects.create(maintenance=self.maintenances[0], title='Note 1', comment='comment 1')
+        Note.objects.create(maintenance=self.maintenances[0], title='Note 2', comment='comment 2')
+        Note.objects.create(maintenance=self.maintenances[1], title='Note 3', comment='comment 3')
+        self.assertEqual(self.maintenances[0].notes.count(), 2)
+
+        self.maintenances[0].delete()
+        self.assertEqual(list(Note.objects.values_list('title', flat=True)), ['Note 3'])
+
+    def test_changelog_related_object(self):
+        # Same as CircuitImpactTestCase.test_changelog_related_object, including the missing delete
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = User.objects.create_user(username='user1')
+        maintenance = self.maintenances[0]
+
+        with event_tracking(request):
+            note = Note.objects.create(maintenance=maintenance, title='Note 1', comment='comment 1')
+        with event_tracking(request):
+            note.snapshot()
+            note.level = NoteLevelChoices.WARNING
+            note.save()
+
+        changes = ObjectChange.objects.filter(
+            changed_object_type=ObjectType.objects.get_for_model(Note), changed_object_id=note.pk
+        ).order_by('pk')
+        self.assertEqual(
+            [(change.action, change.related_object_type.model, change.related_object_id) for change in changes],
+            [
+                (ObjectChangeActionChoices.ACTION_CREATE, 'circuitmaintenance', maintenance.pk),
+                (ObjectChangeActionChoices.ACTION_UPDATE, 'circuitmaintenance', maintenance.pk),
+            ],
+        )
+
+    def test_docs_url(self):
+        self.assertIsNone(Note().docs_url)
+
+    def test_features(self):
+        features = set(ObjectType.objects.get_for_model(Note).features)
 
         self.assertLessEqual(NETBOX_MODEL_FEATURES, features)

@@ -4,12 +4,13 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 from netbox.models import NetBoxModel, PrimaryModel
 
-from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from .constants import MAX_MAINTENANCE_NAME_LENGTH
+from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from .constants import MAX_MAINTENANCE_NAME_LENGTH, MAX_NOTE_TITLE_LENGTH
 
 __all__ = (
     'CircuitImpact',
     'CircuitMaintenance',
+    'Note',
 )
 
 
@@ -130,6 +131,62 @@ class CircuitImpact(NetBoxModel):
 
     def to_objectchange(self, action):
         # List impact changes in the maintenance's changelog
+        objectchange = super().to_objectchange(action)
+        objectchange.related_object = self.maintenance
+        return objectchange
+
+
+class Note(NetBoxModel):
+    """
+    A remark on a CircuitMaintenance, such as the handler's warning about a circuit ID it couldn't find. Titles are
+    unique per maintenance.
+    """
+
+    maintenance = models.ForeignKey(
+        to='netbox_circuit_maintenance.CircuitMaintenance',
+        on_delete=models.CASCADE,
+        related_name='notes',
+        verbose_name=_('maintenance'),
+    )
+    title = models.CharField(
+        verbose_name=_('title'),
+        max_length=MAX_NOTE_TITLE_LENGTH,
+    )
+    level = models.CharField(
+        verbose_name=_('level'),
+        max_length=50,
+        choices=NoteLevelChoices,
+        default=NoteLevelChoices.INFO,
+    )
+    comment = models.TextField(
+        verbose_name=_('comment'),
+    )
+
+    class Meta:
+        ordering = ['last_updated', 'pk']
+        constraints = (
+            models.UniqueConstraint(
+                fields=('maintenance', 'title'),
+                name='%(app_label)s_%(class)s_unique_maintenance_title',
+            ),
+        )
+        indexes = (models.Index(fields=('last_updated', 'id')),)  # Default ordering
+        verbose_name = _('note')
+        verbose_name_plural = _('notes')
+
+    def __str__(self):
+        return self.title
+
+    @property
+    def docs_url(self):
+        # Same as CircuitMaintenance.docs_url
+        return None
+
+    def get_level_color(self):
+        return NoteLevelChoices.colors.get(self.level)
+
+    def to_objectchange(self, action):
+        # List note changes in the maintenance's changelog
         objectchange = super().to_objectchange(action)
         objectchange.related_object = self.maintenance
         return objectchange

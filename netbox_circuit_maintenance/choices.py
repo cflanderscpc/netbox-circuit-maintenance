@@ -46,3 +46,19 @@ class CircuitImpactChoices(ChoiceSet):
         (DEGRADED, _('Degraded'), 'orange'),
         (OUTAGE, _('Outage'), 'red'),
     )
+
+
+#
+# Note
+#
+
+
+# Not part of the maintnote standard. The handler creates WARNING notes for circuit IDs it can't find.
+class NoteLevelChoices(ChoiceSet):
+    INFO = 'INFO'
+    WARNING = 'WARNING'
+
+    CHOICES = (
+        (INFO, _('Info'), 'cyan'),
+        (WARNING, _('Warning'), 'yellow'),
+    )
