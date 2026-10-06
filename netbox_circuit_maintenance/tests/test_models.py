@@ -13,6 +13,7 @@ from extras.models import ExportTemplate
 from google.oauth2.credentials import Credentials
 from netbox.context_managers import event_tracking
 from users.models import User
+from utilities.querydict import prepare_cloned_fields
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
 from netbox_circuit_maintenance.constants import (
@@ -241,9 +242,9 @@ class CircuitImpactTestCase(TestCase):
         self.assertEqual(list(CircuitImpact.objects.values_list('circuit__cid', flat=True)), ['CID-2'])
 
     def test_changelog_related_object(self):
-        # Impact changes show in the maintenance's changelog. Deletes can't be covered until the REST serializer
-        # exists: under event tracking NetBox serializes a deleted object for events straight away, and without a
-        # serializer that raises SerializerNotFound.
+        # Impact changes, including a delete cascaded from the core circuit, show in the maintenance's changelog. Under
+        # event tracking NetBox serializes a deleted object for events straight away, so the delete needs the REST
+        # serializer.
         request = RequestFactory().get('/')
         request.id = uuid.uuid4()
         request.user = User.objects.create_user(username='user1')
@@ -255,15 +256,19 @@ class CircuitImpactTestCase(TestCase):
             impact.snapshot()
             impact.impact = CircuitImpactChoices.NO_IMPACT
             impact.save()
+        impact_pk = impact.pk
+        with event_tracking(request):
+            self.circuits[0].delete()
 
         changes = ObjectChange.objects.filter(
-            changed_object_type=ObjectType.objects.get_for_model(CircuitImpact), changed_object_id=impact.pk
+            changed_object_type=ObjectType.objects.get_for_model(CircuitImpact), changed_object_id=impact_pk
         ).order_by('pk')
         self.assertEqual(
             [(change.action, change.related_object_type.model, change.related_object_id) for change in changes],
             [
                 (ObjectChangeActionChoices.ACTION_CREATE, 'circuitmaintenance', maintenance.pk),
                 (ObjectChangeActionChoices.ACTION_UPDATE, 'circuitmaintenance', maintenance.pk),
+                (ObjectChangeActionChoices.ACTION_DELETE, 'circuitmaintenance', maintenance.pk),
             ],
         )
 
@@ -282,6 +287,21 @@ class CircuitImpactTestCase(TestCase):
 
     def test_docs_url(self):
         self.assertIsNone(CircuitImpact().docs_url)
+
+    def test_get_absolute_url(self):
+        impact = CircuitImpact.objects.create(maintenance=self.maintenances[0], circuit=self.circuits[0])
+
+        self.assertEqual(impact.get_absolute_url(), f'/plugins/circuit-maintenance/circuit-impacts/{impact.pk}/')
+
+    def test_clone_fields(self):
+        impact = CircuitImpact.objects.create(
+            maintenance=self.maintenances[0], circuit=self.circuits[0], impact=CircuitImpactChoices.DEGRADED
+        )
+
+        self.assertEqual(
+            prepare_cloned_fields(impact).dict(),
+            {'maintenance': str(self.maintenances[0].pk), 'impact': CircuitImpactChoices.DEGRADED},
+        )
 
     def test_features(self):
         features = set(ObjectType.objects.get_for_model(CircuitImpact).features)
@@ -372,7 +392,8 @@ class NoteTestCase(TestCase):
         self.assertEqual(list(Note.objects.values_list('title', flat=True)), ['Note 3'])
 
     def test_changelog_related_object(self):
-        # Same as CircuitImpactTestCase.test_changelog_related_object, including the missing delete
+        # Same as CircuitImpactTestCase.test_changelog_related_object, without the delete until this model has a REST
+        # serializer
         request = RequestFactory().get('/')
         request.id = uuid.uuid4()
         request.user = User.objects.create_user(username='user1')
@@ -823,7 +844,8 @@ class ParsedNotificationTestCase(TestCase):
         self.assertFalse(ParsedNotification.objects.exists())
 
     def test_changelog_related_object(self):
-        # Same as CircuitImpactTestCase.test_changelog_related_object, including the missing delete
+        # Same as CircuitImpactTestCase.test_changelog_related_object, without the delete until this model has a REST
+        # serializer
         request = RequestFactory().get('/')
         request.id = uuid.uuid4()
         request.user = User.objects.create_user(username='user1')

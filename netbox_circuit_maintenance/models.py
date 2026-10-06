@@ -121,6 +121,12 @@ class CircuitImpact(NetBoxModel):
         default=CircuitImpactChoices.OUTAGE,
     )
 
+    clone_fields = ('maintenance', 'impact')
+    prerequisite_models = (
+        'netbox_circuit_maintenance.CircuitMaintenance',
+        'circuits.Circuit',
+    )
+
     class Meta:
         ordering = ['maintenance', 'impact', 'pk']
         constraints = (

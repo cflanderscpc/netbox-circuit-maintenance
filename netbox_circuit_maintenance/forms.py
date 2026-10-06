@@ -1,17 +1,36 @@
 from circuits.models import Circuit, Provider
 from django import forms
 from django.utils.translation import gettext_lazy as _
-from netbox.forms import PrimaryModelBulkEditForm, PrimaryModelFilterSetForm, PrimaryModelForm, PrimaryModelImportForm
+from netbox.forms import (
+    NetBoxModelBulkEditForm,
+    NetBoxModelFilterSetForm,
+    NetBoxModelForm,
+    NetBoxModelImportForm,
+    PrimaryModelBulkEditForm,
+    PrimaryModelFilterSetForm,
+    PrimaryModelForm,
+    PrimaryModelImportForm,
+)
 from utilities.forms import add_blank_choice
 from utilities.forms.constants import BOOLEAN_WITH_BLANK_CHOICES
-from utilities.forms.fields import CSVChoiceField, DynamicModelMultipleChoiceField, TagFilterField
+from utilities.forms.fields import (
+    CSVChoiceField,
+    CSVModelChoiceField,
+    DynamicModelChoiceField,
+    DynamicModelMultipleChoiceField,
+    TagFilterField,
+)
 from utilities.forms.rendering import FieldSet
 from utilities.forms.widgets import BulkEditNullBooleanSelect, DateTimePicker
 
-from .choices import CircuitMaintenanceStatusChoices
-from .models import CircuitMaintenance
+from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
+from .models import CircuitImpact, CircuitMaintenance
 
 __all__ = (
+    'CircuitImpactBulkEditForm',
+    'CircuitImpactFilterForm',
+    'CircuitImpactForm',
+    'CircuitImpactImportForm',
     'CircuitMaintenanceBulkEditForm',
     'CircuitMaintenanceFilterForm',
     'CircuitMaintenanceForm',
@@ -112,5 +131,90 @@ class CircuitMaintenanceFilterForm(PrimaryModelFilterSetForm):
         queryset=Circuit.objects.all(),
         required=False,
         label=_('Circuit'),
+    )
+    tag = TagFilterField(model)
+
+
+#
+# CircuitImpact
+#
+
+
+class CircuitImpactForm(NetBoxModelForm):
+    # Pre-filled from ?maintenance=<pk> when added from a maintenance's page
+    maintenance = DynamicModelChoiceField(
+        label=_('Maintenance'),
+        queryset=CircuitMaintenance.objects.all(),
+    )
+    circuit = DynamicModelChoiceField(
+        label=_('Circuit'),
+        queryset=Circuit.objects.all(),
+        selector=True,
+    )
+
+    fieldsets = (FieldSet('maintenance', 'circuit', 'impact', 'tags', name=_('Circuit Impact')),)
+
+    class Meta:
+        model = CircuitImpact
+        fields = ('maintenance', 'circuit', 'impact', 'tags')
+
+
+class CircuitImpactBulkEditForm(NetBoxModelBulkEditForm):
+    impact = forms.ChoiceField(
+        label=_('Impact'),
+        choices=add_blank_choice(CircuitImpactChoices),
+        required=False,
+        initial='',
+    )
+
+    model = CircuitImpact
+    fieldsets = (FieldSet('impact'),)
+
+
+class CircuitImpactImportForm(NetBoxModelImportForm):
+    maintenance = CSVModelChoiceField(
+        label=_('Maintenance'),
+        queryset=CircuitMaintenance.objects.all(),
+        to_field_name='name',
+        help_text=_('Name of the maintenance'),
+    )
+    circuit = CSVModelChoiceField(
+        label=_('Circuit'),
+        queryset=Circuit.objects.all(),
+        to_field_name='cid',
+        help_text=_('Circuit ID (use a "circuit.id" column when the same CID exists under several providers)'),
+    )
+    impact = CSVChoiceField(
+        label=_('Impact'),
+        choices=CircuitImpactChoices,
+        required=False,
+        help_text=_('Impact on the circuit (default: Outage)'),
+    )
+
+    class Meta:
+        model = CircuitImpact
+        fields = ('maintenance', 'circuit', 'impact', 'tags')
+
+
+class CircuitImpactFilterForm(NetBoxModelFilterSetForm):
+    model = CircuitImpact
+    fieldsets = (
+        FieldSet('q', 'filter_id', 'tag'),
+        FieldSet('maintenance_id', 'circuit_id', 'impact', name=_('Attributes')),
+    )
+    maintenance_id = DynamicModelMultipleChoiceField(
+        queryset=CircuitMaintenance.objects.all(),
+        required=False,
+        label=_('Maintenance'),
+    )
+    circuit_id = DynamicModelMultipleChoiceField(
+        queryset=Circuit.objects.all(),
+        required=False,
+        label=_('Circuit'),
+    )
+    impact = forms.MultipleChoiceField(
+        label=_('Impact'),
+        choices=CircuitImpactChoices,
+        required=False,
     )
     tag = TagFilterField(model)

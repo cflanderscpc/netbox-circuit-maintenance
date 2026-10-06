@@ -20,3 +20,10 @@ class CircuitMaintenancePanel(panels.ObjectAttributesPanel):
     ack = attrs.BooleanAttr('ack', label=_('Acknowledged'))
     notifying_provider = NotifyingProviderAttr('parsed_notifications', linkify=True, label=_('Notifying provider'))
     description = attrs.TextAttr('description')
+
+
+class CircuitImpactPanel(panels.ObjectAttributesPanel):
+    maintenance = attrs.RelatedObjectAttr('maintenance', linkify=True)
+    provider = attrs.RelatedObjectAttr('circuit.provider', linkify=True)
+    circuit = attrs.RelatedObjectAttr('circuit', linkify=True)
+    impact = attrs.ChoiceAttr('impact')

@@ -4,8 +4,8 @@ from circuits.models import Circuit, CircuitType, Provider
 from django.test import TestCase, override_settings
 from utilities.testing import ChangeLoggedFilterSetTests
 
-from netbox_circuit_maintenance.choices import CircuitMaintenanceStatusChoices
-from netbox_circuit_maintenance.filtersets import CircuitMaintenanceFilterSet
+from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
+from netbox_circuit_maintenance.filtersets import CircuitImpactFilterSet, CircuitMaintenanceFilterSet
 from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
@@ -115,3 +115,62 @@ class CircuitMaintenanceTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
         params = {'circuit': [self.circuits[1].cid, self.circuits[2].cid]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+
+@override_settings(TIME_ZONE='UTC')
+class CircuitImpactTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = CircuitImpact.objects.all()
+    filterset = CircuitImpactFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+        providers = (
+            Provider.objects.create(name='Provider 1', slug='provider-1'),
+            Provider.objects.create(name='Provider 2', slug='provider-2'),
+        )
+        circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
+        # The same CID under two providers
+        cls.circuits = (
+            Circuit.objects.create(cid='CID-1', provider=providers[0], type=circuit_type),
+            Circuit.objects.create(cid='CID-2', provider=providers[0], type=circuit_type),
+            Circuit.objects.create(cid='CID-2', provider=providers[1], type=circuit_type),
+        )
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(
+                name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
+            ),
+        )
+
+        CircuitImpact.objects.bulk_create(
+            (
+                CircuitImpact(
+                    maintenance=cls.maintenances[0], circuit=cls.circuits[0], impact=CircuitImpactChoices.NO_IMPACT
+                ),
+                CircuitImpact(
+                    maintenance=cls.maintenances[0], circuit=cls.circuits[1], impact=CircuitImpactChoices.DEGRADED
+                ),
+                CircuitImpact(maintenance=cls.maintenances[1], circuit=cls.circuits[2]),
+            )
+        )
+
+    def test_q(self):
+        self.assertEqual(self.filterset({'q': 'UT-TEST-2'}, self.queryset).qs.count(), 1)
+        self.assertEqual(self.filterset({'q': 'CID-2'}, self.queryset).qs.count(), 2)
+
+    def test_maintenance(self):
+        params = {'maintenance_id': [self.maintenances[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'maintenance': [self.maintenances[0].name, self.maintenances[1].name]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_circuit(self):
+        params = {'circuit_id': [self.circuits[0].pk, self.circuits[2].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        # A CID matches every provider's circuit with that ID
+        params = {'circuit': ['CID-2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_impact(self):
+        params = {'impact': [CircuitImpactChoices.NO_IMPACT, CircuitImpactChoices.OUTAGE]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)

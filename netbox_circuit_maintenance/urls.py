@@ -12,4 +12,12 @@ urlpatterns = [
         'circuit-maintenances/<int:pk>/',
         include(get_model_urls('netbox_circuit_maintenance', 'circuitmaintenance')),
     ),
+    path(
+        'circuit-impacts/',
+        include(get_model_urls('netbox_circuit_maintenance', 'circuitimpact', detail=False)),
+    ),
+    path(
+        'circuit-impacts/<int:pk>/',
+        include(get_model_urls('netbox_circuit_maintenance', 'circuitimpact')),
+    ),
 ]

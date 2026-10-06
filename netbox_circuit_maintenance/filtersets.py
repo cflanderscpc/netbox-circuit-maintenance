@@ -2,14 +2,17 @@ import django_filters
 from circuits.models import Circuit, Provider
 from django.db.models import Q
 from django.utils.translation import gettext as _
-from netbox.filtersets import PrimaryModelFilterSet
+from netbox.filtersets import NetBoxModelFilterSet, PrimaryModelFilterSet
 from utilities.filters import MultiValueCharFilter
 from utilities.filtersets import register_filterset
 
-from .choices import CircuitMaintenanceStatusChoices
-from .models import CircuitMaintenance
+from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
+from .models import CircuitImpact, CircuitMaintenance
 
-__all__ = ('CircuitMaintenanceFilterSet',)
+__all__ = (
+    'CircuitImpactFilterSet',
+    'CircuitMaintenanceFilterSet',
+)
 
 
 @register_filterset
@@ -55,3 +58,45 @@ class CircuitMaintenanceFilterSet(PrimaryModelFilterSet):
         return queryset.filter(
             Q(name__icontains=value) | Q(description__icontains=value) | Q(comments__icontains=value)
         )
+
+
+@register_filterset
+class CircuitImpactFilterSet(NetBoxModelFilterSet):
+    maintenance_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=CircuitMaintenance.objects.all(),
+        distinct=False,
+        label=_('Maintenance (ID)'),
+    )
+    maintenance = django_filters.ModelMultipleChoiceFilter(
+        field_name='maintenance__name',
+        queryset=CircuitMaintenance.objects.all(),
+        distinct=False,
+        to_field_name='name',
+        label=_('Maintenance (name)'),
+    )
+    circuit_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=Circuit.objects.all(),
+        distinct=False,
+        label=_('Circuit (ID)'),
+    )
+    circuit = django_filters.ModelMultipleChoiceFilter(
+        field_name='circuit__cid',
+        queryset=Circuit.objects.all(),
+        distinct=False,
+        to_field_name='cid',
+        label=_('Circuit (CID)'),
+    )
+    impact = django_filters.MultipleChoiceFilter(
+        choices=CircuitImpactChoices,
+        distinct=False,
+        null_value=None,
+    )
+
+    class Meta:
+        model = CircuitImpact
+        fields = ('id',)
+
+    def search(self, queryset, name, value):
+        if not value.strip():
+            return queryset
+        return queryset.filter(Q(maintenance__name__icontains=value) | Q(circuit__cid__icontains=value))

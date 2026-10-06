@@ -1,11 +1,13 @@
+from django.utils.translation import gettext_lazy as _
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
-from netbox.ui import layout
-from netbox.ui.panels import CommentsPanel
+from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport
+from netbox.ui import actions, layout
+from netbox.ui.panels import CommentsPanel, ObjectsTablePanel
 from netbox.views import generic
 from utilities.views import register_model_view
 
 from . import filtersets, forms, tables
-from .models import CircuitMaintenance
+from .models import CircuitImpact, CircuitMaintenance
 from .ui import panels
 
 #
@@ -34,6 +36,30 @@ class CircuitMaintenanceView(generic.ObjectView):
         ],
         right_panels=[
             CustomFieldsPanel(),
+        ],
+        bottom_panels=[
+            ObjectsTablePanel(
+                model='netbox_circuit_maintenance.CircuitImpact',
+                title=_('Circuits'),
+                filters={'maintenance_id': lambda ctx: ctx['object'].pk},
+                include_columns=[
+                    'circuit',
+                    'impact',
+                    'provider',
+                    'circuit_type',
+                    'circuit_status',
+                    'termination_a',
+                    'termination_z',
+                    'circuit_description',
+                ],
+                exclude_columns=['maintenance'],
+                actions=[
+                    actions.AddObject(
+                        'netbox_circuit_maintenance.CircuitImpact',
+                        url_params={'maintenance': lambda ctx: ctx['object'].pk},
+                    ),
+                ],
+            ),
         ],
     )
 
@@ -69,3 +95,65 @@ class CircuitMaintenanceBulkDeleteView(generic.BulkDeleteView):
     queryset = CircuitMaintenance.objects.all()
     filterset = filtersets.CircuitMaintenanceFilterSet
     table = tables.CircuitMaintenanceTable
+
+
+#
+# CircuitImpact
+#
+
+
+@register_model_view(CircuitImpact, 'list', path='', detail=False)
+class CircuitImpactListView(generic.ObjectListView):
+    queryset = CircuitImpact.objects.all()
+    filterset = filtersets.CircuitImpactFilterSet
+    filterset_form = forms.CircuitImpactFilterForm
+    table = tables.CircuitImpactTable
+    actions = (AddObject, BulkImport, BulkExport, BulkEdit, BulkDelete)
+
+
+@register_model_view(CircuitImpact)
+class CircuitImpactView(generic.ObjectView):
+    queryset = CircuitImpact.objects.all()
+    template_name = 'generic/object.html'
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.CircuitImpactPanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            CustomFieldsPanel(),
+        ],
+    )
+
+
+@register_model_view(CircuitImpact, 'add', detail=False)
+@register_model_view(CircuitImpact, 'edit')
+class CircuitImpactEditView(generic.ObjectEditView):
+    queryset = CircuitImpact.objects.all()
+    form = forms.CircuitImpactForm
+
+
+@register_model_view(CircuitImpact, 'delete')
+class CircuitImpactDeleteView(generic.ObjectDeleteView):
+    queryset = CircuitImpact.objects.all()
+
+
+@register_model_view(CircuitImpact, 'bulk_import', path='import', detail=False)
+class CircuitImpactBulkImportView(generic.BulkImportView):
+    queryset = CircuitImpact.objects.all()
+    model_form = forms.CircuitImpactImportForm
+
+
+@register_model_view(CircuitImpact, 'bulk_edit', path='edit', detail=False)
+class CircuitImpactBulkEditView(generic.BulkEditView):
+    queryset = CircuitImpact.objects.all()
+    filterset = filtersets.CircuitImpactFilterSet
+    table = tables.CircuitImpactTable
+    form = forms.CircuitImpactBulkEditForm
+
+
+@register_model_view(CircuitImpact, 'bulk_delete', path='delete', detail=False)
+class CircuitImpactBulkDeleteView(generic.BulkDeleteView):
+    queryset = CircuitImpact.objects.all()
+    filterset = filtersets.CircuitImpactFilterSet
+    table = tables.CircuitImpactTable
