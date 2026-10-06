@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from circuits.models import Circuit, CircuitType, Provider
 from core.choices import ObjectChangeActionChoices
 from core.models import ObjectChange, ObjectType
+from django.conf import settings
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms import modelform_factory
 from django.test import RequestFactory, TestCase
@@ -14,8 +15,14 @@ from netbox.context_managers import event_tracking
 from users.models import User
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from netbox_circuit_maintenance.constants import MAX_NOTE_TITLE_LENGTH
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note, NotificationSource
+from netbox_circuit_maintenance.constants import MAX_NOTE_TITLE_LENGTH, MAX_NOTIFICATION_TOTAL_LENGTH
+from netbox_circuit_maintenance.models import (
+    CircuitImpact,
+    CircuitMaintenance,
+    Note,
+    NotificationSource,
+    RawNotification,
+)
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -521,5 +528,175 @@ class NotificationSourceTestCase(TestCase):
 
     def test_features(self):
         features = set(ObjectType.objects.get_for_model(NotificationSource).features)
+
+        self.assertLessEqual(NETBOX_MODEL_FEATURES, features)
+
+
+class RawNotificationTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider.objects.create(name='Provider 1', slug='provider-1'),
+            Provider.objects.create(name='Provider 2', slug='provider-2'),
+        )
+        cls.source = NotificationSource.objects.create(name='Source 1')
+
+    def raw_notification(self, **kwargs):
+        return RawNotification(
+            **{'raw': b'body', 'subject': 'Subject 1', 'provider': self.providers[0], 'stamp': START, **kwargs}
+        )
+
+    def plugin_settings(self, **overrides):
+        # override_settings replaces the whole setting, so keep the defaults NetBox merged in at startup
+        plugin_config = {**settings.PLUGINS_CONFIG['netbox_circuit_maintenance'], **overrides}
+        return self.settings(PLUGINS_CONFIG={**settings.PLUGINS_CONFIG, 'netbox_circuit_maintenance': plugin_config})
+
+    def test_defaults(self):
+        raw_notification = self.raw_notification()
+        raw_notification.full_clean()
+        raw_notification.save()
+
+        self.assertEqual(raw_notification.sender, '')
+        self.assertIsNone(raw_notification.source)
+        self.assertFalse(raw_notification.parsed)
+        self.assertEqual(str(raw_notification), 'Subject 1')
+
+    def test_future_stamp_warning(self):
+        # Nautobot's test_future_stamp_validation: a future stamp is logged, not rejected
+        stamp = datetime.now(UTC) + timedelta(days=1)
+        raw_notification = self.raw_notification(raw=b'', subject='something', source=self.source, stamp=stamp)
+
+        with self.assertLogs(logger='netbox_circuit_maintenance.models', level='WARNING') as cm:
+            raw_notification.full_clean()
+        self.assertEqual(
+            cm.output,
+            [f"WARNING:netbox_circuit_maintenance.models:Stamp time {stamp} is not consistent, it's in the future."],
+        )
+
+    def test_past_stamp(self):
+        with self.assertNoLogs(logger='netbox_circuit_maintenance.models', level='WARNING'):
+            self.raw_notification().full_clean()
+
+    def test_clean_missing_stamp(self):
+        # Django runs clean() after stamp fails validation, so it mustn't compare None with a datetime
+        with self.assertRaises(ValidationError) as cm:
+            self.raw_notification(stamp=None).full_clean()
+        self.assertEqual(list(cm.exception.message_dict), ['stamp'])
+
+    def test_raw_truncated(self):
+        raw_notification = self.raw_notification(raw=b'x' * 10000)
+        raw_notification.save()
+
+        self.assertEqual(len(RawNotification.objects.get(pk=raw_notification.pk).raw), 8192)  # Default setting
+
+    def test_raw_truncated_to_setting(self):
+        raw_notification = self.raw_notification(raw=b'0123456789abcdef')
+        with self.plugin_settings(raw_notification_size=10):
+            raw_notification.save()
+
+        self.assertEqual(RawNotification.objects.get(pk=raw_notification.pk).raw, b'0123456789')
+
+    def test_raw_truncated_to_max(self):
+        raw_notification = self.raw_notification(raw=b'x' * 20000)
+        with self.plugin_settings(raw_notification_size=20000):
+            raw_notification.save()
+
+        self.assertEqual(len(RawNotification.objects.get(pk=raw_notification.pk).raw), MAX_NOTIFICATION_TOTAL_LENGTH)
+
+    def test_unique_stamp_provider_subject(self):
+        self.raw_notification().save()
+
+        with self.assertRaises(ValidationError) as cm:
+            self.raw_notification(sender='sender@example.com').full_clean()
+        self.assertEqual(
+            cm.exception.message_dict,
+            {NON_FIELD_ERRORS: ['Raw notification with this Stamp, Provider and Subject already exists.']},
+        )
+
+        # Changing any one of the three is fine
+        self.raw_notification(subject='Subject 2').full_clean()
+        self.raw_notification(provider=self.providers[1]).full_clean()
+        self.raw_notification(stamp=END).full_clean()
+
+    def test_ordering(self):
+        # Oldest stamp first, then pk. The handler takes the newest with last()
+        raw_notifications = [
+            RawNotification.objects.create(raw=b'', subject=f'Subject {i}', provider=self.providers[0], stamp=stamp)
+            for i, stamp in enumerate((END, START, START))
+        ]
+
+        self.assertEqual(
+            list(RawNotification.objects.all()), [raw_notifications[1], raw_notifications[2], raw_notifications[0]]
+        )
+        self.assertEqual(RawNotification.objects.last(), raw_notifications[0])
+
+    def test_provider_cascade_delete(self):
+        self.raw_notification().save()
+        self.raw_notification(subject='Subject 2', provider=self.providers[1]).save()
+        self.assertEqual(self.providers[0].maintenance_raw_notifications.count(), 1)
+
+        self.providers[0].delete()
+        self.assertEqual(list(RawNotification.objects.values_list('subject', flat=True)), ['Subject 2'])
+
+    def test_source_delete(self):
+        raw_notification = self.raw_notification(source=self.source)
+        raw_notification.save()
+        self.assertQuerySetEqual(self.source.raw_notifications.all(), [raw_notification])
+
+        self.source.delete()
+        raw_notification.refresh_from_db()
+        self.assertIsNone(raw_notification.source)
+
+    def test_serialize_object_excludes_raw(self):
+        raw_notification = self.raw_notification()
+        raw_notification.save()
+
+        self.assertNotIn('raw', raw_notification.serialize_object())
+        self.assertNotIn('raw', raw_notification.serialize_object(exclude=['last_updated']))
+        self.assertEqual(raw_notification.serialize_object(exclude=['last_updated'])['subject'], 'Subject 1')
+
+    def test_changelog(self):
+        # The change log records the handler's create and parsed update without the body, which stays on the row.
+        # Delete needs the REST serializer (API row)
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = User.objects.create_user(username='user1')
+
+        with event_tracking(request):
+            raw_notification = self.raw_notification()
+            raw_notification.save()
+        with event_tracking(request):
+            raw_notification.snapshot()
+            raw_notification.parsed = True
+            raw_notification.save()
+
+        changes = ObjectChange.objects.filter(
+            changed_object_type=ObjectType.objects.get_for_model(RawNotification), changed_object_id=raw_notification.pk
+        ).order_by('pk')
+        self.assertEqual(
+            [
+                (
+                    change.action,
+                    change.prechange_data and change.prechange_data['parsed'],
+                    change.postchange_data['parsed'],
+                )
+                for change in changes
+            ],
+            [
+                (ObjectChangeActionChoices.ACTION_CREATE, None, False),
+                (ObjectChangeActionChoices.ACTION_UPDATE, False, True),
+            ],
+        )
+        for change in changes:
+            self.assertNotIn('raw', change.prechange_data or {})
+            self.assertNotIn('raw', change.postchange_data)
+        raw_notification.refresh_from_db()
+        self.assertEqual(raw_notification.raw, b'body')
+
+    def test_docs_url(self):
+        self.assertIsNone(RawNotification().docs_url)
+
+    def test_features(self):
+        features = set(ObjectType.objects.get_for_model(RawNotification).features)
 
         self.assertLessEqual(NETBOX_MODEL_FEATURES, features)

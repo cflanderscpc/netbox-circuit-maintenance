@@ -1,18 +1,31 @@
+import logging
+
 from circuits.models import Circuit, Provider
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from netbox.models import NetBoxModel, PrimaryModel
+from netbox.plugins import get_plugin_config
 
 from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from .constants import MAX_MAINTENANCE_NAME_LENGTH, MAX_NOTE_TITLE_LENGTH
+from .constants import (
+    MAX_MAINTENANCE_NAME_LENGTH,
+    MAX_NOTE_TITLE_LENGTH,
+    MAX_NOTIFICATION_SENDER_LENGTH,
+    MAX_NOTIFICATION_SUBJECT_LENGTH,
+    MAX_NOTIFICATION_TOTAL_LENGTH,
+)
 
 __all__ = (
     'CircuitImpact',
     'CircuitMaintenance',
     'Note',
     'NotificationSource',
+    'RawNotification',
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CircuitMaintenance(PrimaryModel):
@@ -243,3 +256,83 @@ class NotificationSource(NetBoxModel):
     def serialize_object(self, exclude=None):
         # Keep the OAuth token out of change records and event rule snapshots
         return super().serialize_object(exclude=[*(exclude or []), '_token'])
+
+
+class RawNotification(NetBoxModel):
+    """
+    A maintenance notification as fetched from a NotificationSource, before parsing. Only the notification handler
+    creates them; a provider's notification is stored once per subject and stamp.
+    """
+
+    raw = models.BinaryField(
+        verbose_name=_('raw'),
+        max_length=MAX_NOTIFICATION_TOTAL_LENGTH,
+    )
+    subject = models.CharField(
+        verbose_name=_('subject'),
+        max_length=MAX_NOTIFICATION_SUBJECT_LENGTH,
+    )
+    provider = models.ForeignKey(
+        to='circuits.Provider',
+        on_delete=models.CASCADE,
+        related_name='maintenance_raw_notifications',
+        verbose_name=_('provider'),
+    )
+    sender = models.CharField(
+        verbose_name=_('sender'),
+        max_length=MAX_NOTIFICATION_SENDER_LENGTH,
+        blank=True,
+    )
+    source = models.ForeignKey(
+        to='netbox_circuit_maintenance.NotificationSource',
+        on_delete=models.SET_NULL,
+        related_name='raw_notifications',
+        blank=True,
+        null=True,
+        verbose_name=_('source'),
+    )
+    parsed = models.BooleanField(
+        verbose_name=_('parsed'),
+        default=False,
+    )
+    stamp = models.DateTimeField(
+        verbose_name=_('stamp'),
+        help_text=_('Date of the notification as reported by its source'),
+    )
+
+    class Meta:
+        ordering = ['stamp', 'pk']
+        constraints = (
+            models.UniqueConstraint(
+                fields=('stamp', 'provider', 'subject'),
+                name='%(app_label)s_%(class)s_unique_notification',
+            ),
+        )
+        indexes = (models.Index(fields=('stamp', 'id')),)  # Default ordering
+        verbose_name = _('raw notification')
+        verbose_name_plural = _('raw notifications')
+
+    def __str__(self):
+        return self.subject
+
+    @property
+    def docs_url(self):
+        # Same as CircuitMaintenance.docs_url
+        return None
+
+    def clean(self):
+        super().clean()
+
+        # stamp is None here when its form field failed validation (Django runs clean() regardless)
+        if self.stamp and self.stamp > timezone.now():
+            logger.warning("Stamp time %s is not consistent, it's in the future.", self.stamp)
+
+    def save(self, *args, **kwargs):
+        # Cap the stored notification. The setting is read per call, so config changes and override_settings apply
+        size = get_plugin_config('netbox_circuit_maintenance', 'raw_notification_size')
+        self.raw = self.raw[: min(size, MAX_NOTIFICATION_TOTAL_LENGTH)]
+        super().save(*args, **kwargs)
+
+    def serialize_object(self, exclude=None):
+        # Keep the notification body (up to 16 KB, about 22 KB as base64) out of change records and event rule snapshots
+        return super().serialize_object(exclude=[*(exclude or []), 'raw'])
