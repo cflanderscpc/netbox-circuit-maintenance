@@ -1,13 +1,13 @@
 from django.utils.translation import gettext_lazy as _
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
-from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport
+from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport, DeleteObject
 from netbox.ui import actions, layout
 from netbox.ui.panels import CommentsPanel, ObjectsTablePanel
 from netbox.views import generic
 from utilities.views import register_model_view
 
 from . import filtersets, forms, tables
-from .models import CircuitImpact, CircuitMaintenance, Note
+from .models import CircuitImpact, CircuitMaintenance, Note, RawNotification
 from .ui import panels
 
 #
@@ -233,3 +233,50 @@ class NoteBulkDeleteView(generic.BulkDeleteView):
     queryset = Note.objects.all()
     filterset = filtersets.NoteFilterSet
     table = tables.NoteTable
+
+
+#
+# RawNotification
+#
+
+
+@register_model_view(RawNotification, 'list', path='', detail=False)
+class RawNotificationListView(generic.ObjectListView):
+    # The table doesn't show the body (up to 16 KB per row)
+    queryset = RawNotification.objects.defer('raw')
+    filterset = filtersets.RawNotificationFilterSet
+    filterset_form = forms.RawNotificationFilterForm
+    table = tables.RawNotificationTable
+    actions = (BulkExport, BulkDelete)
+
+
+@register_model_view(RawNotification)
+class RawNotificationView(generic.ObjectView):
+    queryset = RawNotification.objects.all()
+    template_name = 'generic/object.html'
+    actions = (DeleteObject,)
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.RawNotificationPanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            CustomFieldsPanel(),
+        ],
+        bottom_panels=[
+            panels.RawContentPanel('raw', title=_('Content')),
+        ],
+    )
+
+
+@register_model_view(RawNotification, 'delete')
+class RawNotificationDeleteView(generic.ObjectDeleteView):
+    queryset = RawNotification.objects.all()
+
+
+@register_model_view(RawNotification, 'bulk_delete', path='delete', detail=False)
+class RawNotificationBulkDeleteView(generic.BulkDeleteView):
+    # Not deferring raw: each object's snapshot() and delete event read it anyway, one query per object if deferred
+    queryset = RawNotification.objects.all()
+    filterset = filtersets.RawNotificationFilterSet
+    table = tables.RawNotificationTable

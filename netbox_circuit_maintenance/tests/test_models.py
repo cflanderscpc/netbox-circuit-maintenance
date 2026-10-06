@@ -9,6 +9,7 @@ from django.conf import settings
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms import modelform_factory
 from django.test import RequestFactory, TestCase
+from extras.events import serialize_for_event
 from extras.models import ExportTemplate
 from google.oauth2.credentials import Credentials
 from netbox.context_managers import event_tracking
@@ -708,8 +709,8 @@ class RawNotificationTestCase(TestCase):
         self.assertEqual(raw_notification.serialize_object(exclude=['last_updated'])['subject'], 'Subject 1')
 
     def test_changelog(self):
-        # The change log records the handler's create and parsed update without the body, which stays on the row.
-        # Delete needs the REST serializer (API row)
+        # The change log records the handler's create and parsed update, and a delete, without the body. Under event
+        # tracking NetBox serializes a deleted object for events straight away, so the delete needs the REST serializer
         request = RequestFactory().get('/')
         request.id = uuid.uuid4()
         request.user = User.objects.create_user(username='user1')
@@ -721,29 +722,51 @@ class RawNotificationTestCase(TestCase):
             raw_notification.snapshot()
             raw_notification.parsed = True
             raw_notification.save()
+        raw_notification.refresh_from_db()
+        self.assertEqual(raw_notification.raw, b'body')
+        raw_notification_pk = raw_notification.pk
+        with event_tracking(request):
+            raw_notification.snapshot()
+            raw_notification.delete()
 
         changes = ObjectChange.objects.filter(
-            changed_object_type=ObjectType.objects.get_for_model(RawNotification), changed_object_id=raw_notification.pk
+            changed_object_type=ObjectType.objects.get_for_model(RawNotification), changed_object_id=raw_notification_pk
         ).order_by('pk')
         self.assertEqual(
             [
                 (
                     change.action,
                     change.prechange_data and change.prechange_data['parsed'],
-                    change.postchange_data['parsed'],
+                    change.postchange_data and change.postchange_data['parsed'],
                 )
                 for change in changes
             ],
             [
                 (ObjectChangeActionChoices.ACTION_CREATE, None, False),
                 (ObjectChangeActionChoices.ACTION_UPDATE, False, True),
+                (ObjectChangeActionChoices.ACTION_DELETE, True, None),
             ],
         )
         for change in changes:
             self.assertNotIn('raw', change.prechange_data or {})
-            self.assertNotIn('raw', change.postchange_data)
-        raw_notification.refresh_from_db()
-        self.assertEqual(raw_notification.raw, b'body')
+            self.assertNotIn('raw', change.postchange_data or {})
+
+    def test_event_data_includes_raw(self):
+        # Event rule and webhook data comes from the REST serializer, which returns the body as base64, although change
+        # records leave it out (Decisions 2026-10-06)
+        raw_notification = self.raw_notification()
+        raw_notification.save()
+
+        self.assertEqual(serialize_for_event(raw_notification)['raw'], 'Ym9keQ==')
+
+    def test_get_absolute_url(self):
+        raw_notification = self.raw_notification()
+        raw_notification.save()
+
+        self.assertEqual(
+            raw_notification.get_absolute_url(),
+            f'/plugins/circuit-maintenance/raw-notifications/{raw_notification.pk}/',
+        )
 
     def test_docs_url(self):
         self.assertIsNone(RawNotification().docs_url)

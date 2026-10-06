@@ -1,7 +1,7 @@
-from netbox.api.viewsets import NetBoxModelViewSet
+from netbox.api.viewsets import NetBoxModelViewSet, NetBoxReadOnlyModelViewSet
 
 from .. import filtersets
-from ..models import CircuitImpact, CircuitMaintenance, Note
+from ..models import CircuitImpact, CircuitMaintenance, Note, RawNotification
 from . import serializers
 
 
@@ -21,3 +21,9 @@ class NoteViewSet(NetBoxModelViewSet):
     queryset = Note.objects.all()
     serializer_class = serializers.NoteSerializer
     filterset_class = filtersets.NoteFilterSet
+
+
+class RawNotificationViewSet(NetBoxReadOnlyModelViewSet):
+    queryset = RawNotification.objects.all()
+    serializer_class = serializers.RawNotificationSerializer
+    filterset_class = filtersets.RawNotificationFilterSet

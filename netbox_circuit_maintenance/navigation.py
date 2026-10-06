@@ -14,6 +14,16 @@ menu = PluginMenu(
                 ),
             ),
         ),
+        (
+            _('Notifications'),
+            (
+                PluginMenuItem(
+                    link='plugins:netbox_circuit_maintenance:rawnotification_list',
+                    link_text=_('Notifications'),
+                    permissions=['netbox_circuit_maintenance.view_rawnotification'],
+                ),
+            ),
+        ),
     ),
     icon_class='mdi mdi-wrench-clock',
 )

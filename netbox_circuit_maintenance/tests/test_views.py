@@ -14,6 +14,7 @@ from netbox_circuit_maintenance.models import (
     CircuitImpact,
     CircuitMaintenance,
     Note,
+    NotificationSource,
     ParsedNotification,
     RawNotification,
 )
@@ -596,3 +597,164 @@ class NoteTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObjectViewTe
             ['level', 'title', 'last_updated', 'comment', 'actions'],
         )
         self.assertNotContains(response, maintenance.get_absolute_url())
+
+
+class RawNotificationTestCase(
+    PluginViewTestMixin,
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.GetObjectChangelogViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = RawNotification
+
+    @classmethod
+    def setUpTestData(cls):
+        # No parsed notifications: a delete cascades to them, and under event tracking each deleted object needs a REST
+        # serializer, which that model doesn't have yet
+        cls.providers = (
+            Provider(name='Provider 3', slug='provider-3'),
+            Provider(name='Provider 4', slug='provider-4'),
+        )
+        Provider.objects.bulk_create(cls.providers)
+
+        cls.source = NotificationSource.objects.create(name='Source 1')
+
+        # Distinct stamps: Nautobot's test relied on separate datetime.now() calls
+        RawNotification.objects.create(
+            subject='Subject 1',
+            provider=cls.providers[0],
+            sender='noc@example.com',
+            source=cls.source,
+            raw=b'whatever 1',
+            stamp=START,
+        )
+        RawNotification.objects.create(
+            subject='Subject 2',
+            provider=cls.providers[1],
+            source=cls.source,
+            raw=b'whatever 2',
+            stamp=START + timedelta(hours=1),
+        )
+        RawNotification.objects.create(
+            subject='Subject 3',
+            provider=cls.providers[1],
+            source=cls.source,
+            raw=b'whatever 3',
+            stamp=START + timedelta(hours=2),
+        )
+
+    def test_get_object_attributes(self):
+        raw_notification = RawNotification.objects.get(subject='Subject 1')
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_rawnotification',
+            'netbox_circuit_maintenance.add_rawnotification',
+            'netbox_circuit_maintenance.change_rawnotification',
+            'netbox_circuit_maintenance.delete_rawnotification',
+        )
+
+        response = self.client.get(raw_notification.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        for text in ('Subject 1', 'noc@example.com', self.providers[0].get_absolute_url(), 'Source 1'):
+            self.assertContains(response, text)
+        # Raw notifications can only be deleted, whatever the user's permissions
+        self.assertContains(response, self._get_url('delete', raw_notification))
+        self.assertNotContains(response, f'{raw_notification.get_absolute_url()}edit/')
+        self.assertNotContains(response, f'{self._get_url("list")}add/')
+
+    def test_get_object_without_source(self):
+        # A deleted source leaves source empty
+        raw_notification = RawNotification.objects.get(subject='Subject 1')
+        raw_notification.source = None
+        raw_notification.save()
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+
+        response = self.client.get(raw_notification.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, 'Source 1')
+
+    def test_get_object_content(self):
+        # The body is escaped, and a character the size cap cut in two doesn't hide the rest of it
+        raw_notification = RawNotification.objects.get(subject='Subject 1')
+        raw_notification.raw = '<b>Maintenance</b> café'.encode()[:-1]
+        raw_notification.save()
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+
+        response = self.client.get(raw_notification.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, '&lt;b&gt;Maintenance&lt;/b&gt; caf\N{REPLACEMENT CHARACTER}')
+        self.assertNotContains(response, '<b>Maintenance</b>')
+
+    def test_get_object_parsed_maintenance(self):
+        # A parsed notification links to the maintenance of its most recently updated parsed notification
+        raw_notification = RawNotification.objects.get(subject='Subject 1')
+        maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(name='UT-TEST-2', start_time=START, end_time=END),
+        )
+        for maintenance in maintenances:
+            ParsedNotification.objects.create(
+                maintenance=maintenance, raw_notification=raw_notification, json={'maintenance_id': maintenance.name}
+            )
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+
+        response = self.client.get(raw_notification.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, maintenances[1].get_absolute_url())
+
+        raw_notification.parsed = True
+        raw_notification.save()
+        response = self.client.get(raw_notification.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, maintenances[1].get_absolute_url())
+        self.assertNotContains(response, maintenances[0].get_absolute_url())
+
+    def test_list_objects_filtered(self):
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+
+        response = self.client.get(
+            self._get_url('list'), {'provider_id': self.providers[1].pk, 'since': START + timedelta(hours=2)}
+        )
+        self.assertHttpStatus(response, 200)
+        self.assertEqual([str(raw_notification) for raw_notification in response.context['table'].data], ['Subject 3'])
+
+    def test_menu_item(self):
+        # Gated on the raw notifications' own permission, not view_circuitmaintenance as in Nautobot
+        list_url = self._get_url('list')
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+        response = self.client.get(reverse('home'))
+        self.assertNotContains(response, f'href="{list_url}"')
+
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+        response = self.client.get(reverse('home'))
+        self.assertContains(response, f'href="{list_url}"')
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_provider_related_objects(self):
+        # Core's Provider page lists the provider's raw notifications under Related objects
+        self.add_permissions('circuits.view_provider')
+
+        response = self.client.get(self.providers[1].get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, f'{self._get_url("list")}?provider_id={self.providers[1].pk}')
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_delete_provider_with_raw_notifications(self):
+        # Deleting a core provider cascades to its raw notifications, which under event tracking need the REST serializer
+        provider = self.providers[1]
+        raw_notification = RawNotification.objects.get(subject='Subject 2')
+        obj_perm = ObjectPermission(name='Test permission', actions=['delete'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Provider))
+
+        # The confirmation lists the raw notifications with links
+        response = self.client.get(reverse('circuits:provider_delete', kwargs={'pk': provider.pk}))
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, raw_notification.get_absolute_url())
+        response = self.client.post(
+            reverse('circuits:provider_delete', kwargs={'pk': provider.pk}), post_data({'confirm': True})
+        )
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(list(RawNotification.objects.values_list('subject', flat=True)), ['Subject 1'])

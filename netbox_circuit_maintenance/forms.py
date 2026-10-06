@@ -26,7 +26,7 @@ from utilities.forms.widgets import BulkEditNullBooleanSelect, DateTimePicker
 
 from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
 from .constants import MAX_NOTE_TITLE_LENGTH
-from .models import CircuitImpact, CircuitMaintenance, Note
+from .models import CircuitImpact, CircuitMaintenance, Note, RawNotification
 
 __all__ = (
     'CircuitImpactBulkEditForm',
@@ -41,6 +41,7 @@ __all__ = (
     'NoteFilterForm',
     'NoteForm',
     'NoteImportForm',
+    'RawNotificationFilterForm',
 )
 
 
@@ -311,5 +312,39 @@ class NoteFilterForm(NetBoxModelFilterSetForm):
     comment = forms.CharField(
         label=_('Comment'),
         required=False,
+    )
+    tag = TagFilterField(model)
+
+
+#
+# RawNotification
+#
+
+
+class RawNotificationFilterForm(NetBoxModelFilterSetForm):
+    model = RawNotification
+    # No source field until NotificationSource has a REST API: the dynamic dropdown reverses its list endpoint
+    fieldsets = (
+        FieldSet('q', 'filter_id', 'tag'),
+        FieldSet('provider_id', 'sender', 'parsed', 'since', name=_('Attributes')),
+    )
+    provider_id = DynamicModelMultipleChoiceField(
+        queryset=Provider.objects.all(),
+        required=False,
+        label=_('Provider'),
+    )
+    sender = forms.CharField(
+        label=_('Sender'),
+        required=False,
+    )
+    parsed = forms.NullBooleanField(
+        label=_('Parsed'),
+        required=False,
+        widget=forms.Select(choices=BOOLEAN_WITH_BLANK_CHOICES),
+    )
+    since = forms.DateTimeField(
+        label=_('Since'),
+        required=False,
+        widget=DateTimePicker(),
     )
     tag = TagFilterField(model)

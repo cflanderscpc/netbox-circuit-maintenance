@@ -7,12 +7,13 @@ from utilities.filters import MultiValueCharFilter
 from utilities.filtersets import register_filterset
 
 from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from .models import CircuitImpact, CircuitMaintenance, Note
+from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, RawNotification
 
 __all__ = (
     'CircuitImpactFilterSet',
     'CircuitMaintenanceFilterSet',
     'NoteFilterSet',
+    'RawNotificationFilterSet',
 )
 
 
@@ -133,3 +134,46 @@ class NoteFilterSet(NetBoxModelFilterSet):
         if not value.strip():
             return queryset
         return queryset.filter(Q(title__icontains=value) | Q(comment__icontains=value))
+
+
+@register_filterset
+class RawNotificationFilterSet(NetBoxModelFilterSet):
+    provider_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=Provider.objects.all(),
+        distinct=False,
+        label=_('Provider (ID)'),
+    )
+    provider = django_filters.ModelMultipleChoiceFilter(
+        field_name='provider__slug',
+        queryset=Provider.objects.all(),
+        distinct=False,
+        to_field_name='slug',
+        label=_('Provider (slug)'),
+    )
+    source_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=NotificationSource.objects.all(),
+        distinct=False,
+        label=_('Notification source (ID)'),
+    )
+    source = django_filters.ModelMultipleChoiceFilter(
+        field_name='source__name',
+        queryset=NotificationSource.objects.all(),
+        distinct=False,
+        to_field_name='name',
+        label=_('Notification source (name)'),
+    )
+    # Nautobot's name for stamp__gte, kept for API clients
+    since = django_filters.DateTimeFilter(
+        field_name='stamp',
+        lookup_expr='gte',
+        label=_('Since'),
+    )
+
+    class Meta:
+        model = RawNotification
+        fields = ('id', 'subject', 'sender', 'parsed', 'stamp')
+
+    def search(self, queryset, name, value):
+        if not value.strip():
+            return queryset
+        return queryset.filter(subject__icontains=value)

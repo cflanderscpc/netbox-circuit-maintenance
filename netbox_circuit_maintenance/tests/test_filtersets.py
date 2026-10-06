@@ -5,8 +5,19 @@ from django.test import TestCase, override_settings
 from utilities.testing import ChangeLoggedFilterSetTests
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from netbox_circuit_maintenance.filtersets import CircuitImpactFilterSet, CircuitMaintenanceFilterSet, NoteFilterSet
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note
+from netbox_circuit_maintenance.filtersets import (
+    CircuitImpactFilterSet,
+    CircuitMaintenanceFilterSet,
+    NoteFilterSet,
+    RawNotificationFilterSet,
+)
+from netbox_circuit_maintenance.models import (
+    CircuitImpact,
+    CircuitMaintenance,
+    Note,
+    NotificationSource,
+    RawNotification,
+)
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -227,3 +238,86 @@ class NoteTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'comment': ['foobar1', 'foobar2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
         self.assertEqual(self.filterset({'comment__ic': ['bar3']}, self.queryset).qs.count(), 1)
+
+
+@override_settings(TIME_ZONE='UTC')
+class RawNotificationTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = RawNotification.objects.all()
+    filterset = RawNotificationFilterSet
+    # The notification body isn't filterable
+    ignore_fields = ('raw',)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider.objects.create(name='Provider 1', slug='provider-1'),
+            Provider.objects.create(name='Provider 2', slug='provider-2'),
+        )
+        cls.sources = (
+            NotificationSource.objects.create(name='Source 1'),
+            NotificationSource.objects.create(name='Source 2'),
+        )
+
+        RawNotification.objects.bulk_create(
+            (
+                RawNotification(
+                    raw=b'foobar',
+                    subject='Subject 1',
+                    provider=cls.providers[0],
+                    sender='noc1@example.com',
+                    source=cls.sources[0],
+                    parsed=True,
+                    stamp=START,
+                ),
+                RawNotification(
+                    raw=b'',
+                    subject='Subject 2',
+                    provider=cls.providers[1],
+                    sender='noc2@example.com',
+                    source=cls.sources[1],
+                    stamp=START + timedelta(hours=1),
+                ),
+                # A deleted source leaves source empty
+                RawNotification(
+                    raw=b'', subject='Other 3', provider=cls.providers[1], stamp=START + timedelta(hours=2)
+                ),
+            )
+        )
+
+    def test_q(self):
+        self.assertEqual(self.filterset({'q': 'subject'}, self.queryset).qs.count(), 2)
+        # Only the subject is searched, as in Nautobot
+        self.assertEqual(self.filterset({'q': 'noc1'}, self.queryset).qs.count(), 0)
+
+    def test_subject(self):
+        params = {'subject': ['Subject 1', 'Other 3']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        self.assertEqual(self.filterset({'subject__ic': ['ject']}, self.queryset).qs.count(), 2)
+
+    def test_provider(self):
+        params = {'provider_id': [self.providers[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'provider': [self.providers[0].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_sender(self):
+        params = {'sender': ['noc1@example.com', 'noc2@example.com']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_source(self):
+        params = {'source_id': [self.sources[0].pk, self.sources[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'source': [self.sources[1].name]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_parsed(self):
+        self.assertEqual(self.filterset({'parsed': 'true'}, self.queryset).qs.count(), 1)
+        self.assertEqual(self.filterset({'parsed': 'false'}, self.queryset).qs.count(), 2)
+
+    def test_stamp(self):
+        self.assertEqual(self.filterset({'stamp': ['2020-10-04T11:00:00Z']}, self.queryset).qs.count(), 1)
+        self.assertEqual(self.filterset({'stamp__gte': ['2020-10-04T11:00:00Z']}, self.queryset).qs.count(), 2)
+
+    def test_since(self):
+        # Nautobot's name for stamp__gte
+        self.assertEqual(self.filterset({'since': '2020-10-04T11:00:00Z'}, self.queryset).qs.count(), 2)

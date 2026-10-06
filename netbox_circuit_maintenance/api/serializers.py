@@ -1,14 +1,16 @@
-from circuits.api.serializers import CircuitSerializer
+from circuits.api.serializers import CircuitSerializer, ProviderSerializer
 from netbox.api.fields import ChoiceField
 from netbox.api.serializers import NetBoxModelSerializer, PrimaryModelSerializer
+from rest_framework import serializers
 
 from ..choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from ..models import CircuitImpact, CircuitMaintenance, Note
+from ..models import CircuitImpact, CircuitMaintenance, Note, RawNotification
 
 __all__ = (
     'CircuitImpactSerializer',
     'CircuitMaintenanceSerializer',
     'NoteSerializer',
+    'RawNotificationSerializer',
 )
 
 
@@ -91,3 +93,31 @@ class NoteSerializer(NetBoxModelSerializer):
             'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'maintenance', 'title', 'level')
+
+
+class RawNotificationSerializer(NetBoxModelSerializer):
+    provider = ProviderSerializer(nested=True, read_only=True)
+    # The source's ID until NotificationSource has a serializer to nest
+    source = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = RawNotification
+        # raw (a non-editable BinaryField) is read-only base64
+        fields = (
+            'id',
+            'url',
+            'display_url',
+            'display',
+            'subject',
+            'provider',
+            'sender',
+            'source',
+            'parsed',
+            'stamp',
+            'raw',
+            'tags',
+            'custom_fields',
+            'created',
+            'last_updated',
+        )
+        brief_fields = ('id', 'url', 'display', 'provider', 'subject', 'stamp')

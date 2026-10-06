@@ -6,7 +6,13 @@ from rest_framework import status
 from utilities.testing import APITestCase, APIViewTestCases
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note
+from netbox_circuit_maintenance.models import (
+    CircuitImpact,
+    CircuitMaintenance,
+    Note,
+    NotificationSource,
+    RawNotification,
+)
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -285,3 +291,78 @@ class NoteTest(
         )
         self.assertHttpStatus(response, status.HTTP_200_OK)
         self.assertEqual([note['title'] for note in response.data['results']], ['Note 2'])
+
+
+# GraphQLTestCase is left out until the GraphQL rows are ported (Decisions 2026-10-06)
+class RawNotificationTest(
+    APIViewTestCases.GetObjectViewTestCase,
+    APIViewTestCases.ListObjectsViewTestCase,
+):
+    model = RawNotification
+    view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    brief_fields = ['display', 'id', 'provider', 'stamp', 'subject', 'url']
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider(name='Provider 1', slug='provider-1'),
+            Provider(name='Provider 2', slug='provider-2'),
+        )
+        Provider.objects.bulk_create(cls.providers)
+        cls.source = NotificationSource.objects.create(name='Source 1')
+
+        RawNotification.objects.bulk_create(
+            (
+                RawNotification(raw=b'body 1', subject='Subject 1', provider=cls.providers[0], stamp=START),
+                RawNotification(
+                    raw=b'body 2',
+                    subject='Subject 2',
+                    provider=cls.providers[1],
+                    source=cls.source,
+                    stamp=START + timedelta(hours=1),
+                ),
+                RawNotification(
+                    raw=b'body 3', subject='Subject 3', provider=cls.providers[1], stamp=START + timedelta(hours=2)
+                ),
+            )
+        )
+
+    def test_get_object_raw_and_source(self):
+        # raw is base64, as Nautobot's serializer returned it; source is the source's ID until it has a serializer
+        raw_notification = RawNotification.objects.get(subject='Subject 2')
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+
+        response = self.client.get(self._get_detail_url(raw_notification), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['raw'], 'Ym9keSAy')
+        self.assertEqual(response.data['source'], self.source.pk)
+        self.assertEqual(response.data['provider']['id'], self.providers[1].pk)
+
+    def test_read_only(self):
+        # Only the notification handler creates raw notifications, and nobody edits them
+        raw_notification = RawNotification.objects.first()
+        self.add_permissions(
+            'netbox_circuit_maintenance.add_rawnotification',
+            'netbox_circuit_maintenance.change_rawnotification',
+            'netbox_circuit_maintenance.delete_rawnotification',
+        )
+
+        response = self.client.post(self._get_list_url(), {}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+        response = self.client.patch(
+            self._get_detail_url(raw_notification), {'parsed': True}, format='json', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+        response = self.client.delete(self._get_detail_url(raw_notification), **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_list_objects_filtered(self):
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+
+        response = self.client.get(
+            self._get_list_url(),
+            {'provider': self.providers[1].slug, 'since': (START + timedelta(hours=2)).isoformat()},
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual([item['subject'] for item in response.data['results']], ['Subject 3'])

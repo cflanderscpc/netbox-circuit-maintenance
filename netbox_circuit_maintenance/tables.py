@@ -2,12 +2,13 @@ import django_tables2 as tables
 from django.utils.translation import gettext_lazy as _
 from netbox.tables import NetBoxTable, PrimaryModelTable, columns
 
-from .models import CircuitImpact, CircuitMaintenance, Note
+from .models import CircuitImpact, CircuitMaintenance, Note, RawNotification
 
 __all__ = (
     'CircuitImpactTable',
     'CircuitMaintenanceTable',
     'NoteTable',
+    'RawNotificationTable',
 )
 
 
@@ -165,3 +166,46 @@ class NoteTable(NetBoxTable):
         )
         # The maintenance's Notes panel order, which also sets the list's (include_columns doesn't move columns)
         default_columns = ('pk', 'maintenance', 'level', 'title', 'last_updated', 'comment')
+
+
+class RawNotificationTable(NetBoxTable):
+    subject = tables.Column(
+        verbose_name=_('Subject'),
+        linkify=True,
+    )
+    provider = tables.Column(
+        verbose_name=_('Provider'),
+        linkify=True,
+    )
+    # Not linked until NotificationSource has a detail view
+    source = tables.Column(
+        verbose_name=_('Source'),
+    )
+    parsed = columns.BooleanColumn(
+        verbose_name=_('Parsed'),
+    )
+    tags = columns.TagColumn(
+        url_name='plugins:netbox_circuit_maintenance:rawnotification_list',
+    )
+    # Raw notifications can't be edited
+    actions = columns.ActionsColumn(
+        actions=('delete', 'changelog'),
+    )
+
+    class Meta(NetBoxTable.Meta):
+        model = RawNotification
+        fields = (
+            'pk',
+            'id',
+            'subject',
+            'provider',
+            'sender',
+            'source',
+            'parsed',
+            'stamp',
+            'tags',
+            'created',
+            'last_updated',
+            'actions',
+        )
+        default_columns = ('pk', 'subject', 'provider', 'sender', 'source', 'parsed', 'stamp')
