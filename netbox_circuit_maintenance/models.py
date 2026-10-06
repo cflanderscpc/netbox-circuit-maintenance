@@ -22,6 +22,7 @@ __all__ = (
     'CircuitMaintenance',
     'Note',
     'NotificationSource',
+    'ParsedNotification',
     'RawNotification',
 )
 
@@ -336,3 +337,49 @@ class RawNotification(NetBoxModel):
     def serialize_object(self, exclude=None):
         # Keep the notification body (up to 16 KB, about 22 KB as base64) out of change records and event rule snapshots
         return super().serialize_object(exclude=[*(exclude or []), 'raw'])
+
+
+class ParsedNotification(NetBoxModel):
+    """
+    The parser's output for one maintenance in a RawNotification. Only the notification handler creates them; a raw
+    notification announcing several maintenances has one per maintenance.
+    """
+
+    maintenance = models.ForeignKey(
+        to='netbox_circuit_maintenance.CircuitMaintenance',
+        on_delete=models.CASCADE,
+        related_name='parsed_notifications',
+        verbose_name=_('maintenance'),
+    )
+    raw_notification = models.ForeignKey(
+        to='netbox_circuit_maintenance.RawNotification',
+        on_delete=models.CASCADE,
+        related_name='parsed_notifications',
+        verbose_name=_('raw notification'),
+    )
+    json = models.JSONField(
+        verbose_name=_('JSON'),
+        help_text=_('Maintenance as parsed from the raw notification'),
+    )
+
+    class Meta:
+        ordering = ['last_updated', 'pk']
+        indexes = (models.Index(fields=('last_updated', 'id')),)  # Default ordering
+        verbose_name = _('parsed notification')
+        verbose_name_plural = _('parsed notifications')
+
+    def __str__(self):
+        # A 200-character subject would make this 224. Event rule notifications store the REST display in a
+        # varchar(200), and only truncate it while the object still exists, so a delete event would fail
+        return f'Parsed notification for {self.raw_notification.subject}'[:200]
+
+    @property
+    def docs_url(self):
+        # Same as CircuitMaintenance.docs_url
+        return None
+
+    def to_objectchange(self, action):
+        # List the handler's parsed notifications in the maintenance's changelog, next to the changes they caused
+        objectchange = super().to_objectchange(action)
+        objectchange.related_object = self.maintenance
+        return objectchange

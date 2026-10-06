@@ -15,12 +15,17 @@ from netbox.context_managers import event_tracking
 from users.models import User
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from netbox_circuit_maintenance.constants import MAX_NOTE_TITLE_LENGTH, MAX_NOTIFICATION_TOTAL_LENGTH
+from netbox_circuit_maintenance.constants import (
+    MAX_NOTE_TITLE_LENGTH,
+    MAX_NOTIFICATION_SUBJECT_LENGTH,
+    MAX_NOTIFICATION_TOTAL_LENGTH,
+)
 from netbox_circuit_maintenance.models import (
     CircuitImpact,
     CircuitMaintenance,
     Note,
     NotificationSource,
+    ParsedNotification,
     RawNotification,
 )
 
@@ -698,5 +703,164 @@ class RawNotificationTestCase(TestCase):
 
     def test_features(self):
         features = set(ObjectType.objects.get_for_model(RawNotification).features)
+
+        self.assertLessEqual(NETBOX_MODEL_FEATURES, features)
+
+
+class ParsedNotificationTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider.objects.create(name='Provider 1', slug='provider-1'),
+            Provider.objects.create(name='Provider 2', slug='provider-2'),
+        )
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(
+                name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
+            ),
+        )
+        cls.raw_notifications = (
+            RawNotification.objects.create(raw=b'body 1', subject='Subject 1', provider=cls.providers[0], stamp=START),
+            RawNotification.objects.create(raw=b'body 2', subject='Subject 2', provider=cls.providers[1], stamp=END),
+        )
+
+    def parsed_notification(self, maintenance=0, raw_notification=0, **kwargs):
+        return ParsedNotification(
+            maintenance=self.maintenances[maintenance],
+            raw_notification=self.raw_notifications[raw_notification],
+            **{'json': {'maintenance_id': 'UT-TEST'}, **kwargs},
+        )
+
+    def test_str(self):
+        self.assertEqual(str(self.parsed_notification()), 'Parsed notification for Subject 1')
+
+    def test_str_truncated(self):
+        # Nautobot's test_run_nonexistent_circuit checks this with a subject the handler cut to 200 characters
+        raw_notification = RawNotification(raw=b'', subject='x' * MAX_NOTIFICATION_SUBJECT_LENGTH)
+        parsed_notification = ParsedNotification(raw_notification=raw_notification)
+
+        self.assertEqual(str(parsed_notification), f'Parsed notification for {"x" * 176}')
+
+    def test_required_fields(self):
+        with self.assertRaises(ValidationError) as cm:
+            ParsedNotification(json=None).full_clean()
+        self.assertEqual(sorted(cm.exception.message_dict), ['json', 'maintenance', 'raw_notification'])
+
+    def test_json_round_trip(self):
+        data = {
+            'circuits': [{'circuit_id': 'CID-1', 'impact': 'OUTAGE'}],
+            'maintenance_id': 'UT-TEST',
+            'start': 1601805600,
+            'summary': 'Planned work',
+        }
+        parsed_notification = self.parsed_notification(json=data)
+        parsed_notification.full_clean()
+        parsed_notification.save()
+
+        self.assertEqual(ParsedNotification.objects.get(pk=parsed_notification.pk).json, data)
+
+    def test_ordering(self):
+        # Least recently updated first, then pk. The raw notification's detail page takes the newest with last()
+        parsed_notifications = [self.parsed_notification() for _ in range(3)]
+        for parsed_notification in parsed_notifications:
+            parsed_notification.save()
+        ParsedNotification.objects.filter(pk=parsed_notifications[0].pk).update(last_updated=START + timedelta(days=1))
+        ParsedNotification.objects.filter(pk__in=(parsed_notifications[1].pk, parsed_notifications[2].pk)).update(
+            last_updated=START
+        )
+
+        self.assertEqual(
+            list(ParsedNotification.objects.all()),
+            [parsed_notifications[1], parsed_notifications[2], parsed_notifications[0]],
+        )
+        self.assertEqual(ParsedNotification.objects.last(), parsed_notifications[0])
+
+    def test_reverse_relations(self):
+        # A raw notification can announce several maintenances, and a maintenance collects every notification about
+        # it. Nautobot had no uniqueness on the pair, so the same one can be stored twice
+        parsed_notifications = (
+            self.parsed_notification(),
+            self.parsed_notification(maintenance=1),
+            self.parsed_notification(raw_notification=1),
+            self.parsed_notification(),
+        )
+        for parsed_notification in parsed_notifications:
+            parsed_notification.full_clean()
+            parsed_notification.save()
+
+        self.assertQuerySetEqual(
+            self.raw_notifications[0].parsed_notifications.all(),
+            [parsed_notifications[0], parsed_notifications[1], parsed_notifications[3]],
+            ordered=False,
+        )
+        self.assertQuerySetEqual(
+            self.maintenances[0].parsed_notifications.all(),
+            [parsed_notifications[0], parsed_notifications[2], parsed_notifications[3]],
+            ordered=False,
+        )
+
+    def test_cascade_delete(self):
+        self.parsed_notification().save()
+        self.parsed_notification(maintenance=1).save()
+        self.parsed_notification(maintenance=1, raw_notification=1).save()
+
+        self.maintenances[0].delete()
+        self.assertEqual(ParsedNotification.objects.count(), 2)
+
+        self.raw_notifications[0].delete()
+        self.assertEqual(ParsedNotification.objects.count(), 1)
+
+        # Deleting a provider cascades through its raw notifications
+        self.providers[1].delete()
+        self.assertFalse(ParsedNotification.objects.exists())
+
+    def test_changelog_related_object(self):
+        # Same as CircuitImpactTestCase.test_changelog_related_object, including the missing delete
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = User.objects.create_user(username='user1')
+        maintenance = self.maintenances[0]
+
+        with event_tracking(request):
+            parsed_notification = self.parsed_notification()
+            parsed_notification.save()
+        with event_tracking(request):
+            parsed_notification.snapshot()
+            parsed_notification.json = {'maintenance_id': 'UT-TEST', 'status': 'CONFIRMED'}
+            parsed_notification.save()
+
+        changes = ObjectChange.objects.filter(
+            changed_object_type=ObjectType.objects.get_for_model(ParsedNotification),
+            changed_object_id=parsed_notification.pk,
+        ).order_by('pk')
+        self.assertEqual(
+            [
+                (change.action, change.related_object_type.model, change.related_object_id, change.object_repr)
+                for change in changes
+            ],
+            [
+                (
+                    ObjectChangeActionChoices.ACTION_CREATE,
+                    'circuitmaintenance',
+                    maintenance.pk,
+                    'Parsed notification for Subject 1',
+                ),
+                (
+                    ObjectChangeActionChoices.ACTION_UPDATE,
+                    'circuitmaintenance',
+                    maintenance.pk,
+                    'Parsed notification for Subject 1',
+                ),
+            ],
+        )
+        # The parser output stays in the change record
+        self.assertEqual(changes[1].postchange_data['json'], {'maintenance_id': 'UT-TEST', 'status': 'CONFIRMED'})
+
+    def test_docs_url(self):
+        self.assertIsNone(ParsedNotification().docs_url)
+
+    def test_features(self):
+        features = set(ObjectType.objects.get_for_model(ParsedNotification).features)
 
         self.assertLessEqual(NETBOX_MODEL_FEATURES, features)
