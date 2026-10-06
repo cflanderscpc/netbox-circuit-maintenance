@@ -392,8 +392,7 @@ class NoteTestCase(TestCase):
         self.assertEqual(list(Note.objects.values_list('title', flat=True)), ['Note 3'])
 
     def test_changelog_related_object(self):
-        # Same as CircuitImpactTestCase.test_changelog_related_object, without the delete until this model has a REST
-        # serializer
+        # Same as CircuitImpactTestCase.test_changelog_related_object, with the delete cascaded from the maintenance
         request = RequestFactory().get('/')
         request.id = uuid.uuid4()
         request.user = User.objects.create_user(username='user1')
@@ -405,20 +404,40 @@ class NoteTestCase(TestCase):
             note.snapshot()
             note.level = NoteLevelChoices.WARNING
             note.save()
+        note_pk, maintenance_pk = note.pk, maintenance.pk
+        with event_tracking(request):
+            maintenance.delete()
 
         changes = ObjectChange.objects.filter(
-            changed_object_type=ObjectType.objects.get_for_model(Note), changed_object_id=note.pk
+            changed_object_type=ObjectType.objects.get_for_model(Note), changed_object_id=note_pk
         ).order_by('pk')
         self.assertEqual(
             [(change.action, change.related_object_type.model, change.related_object_id) for change in changes],
             [
-                (ObjectChangeActionChoices.ACTION_CREATE, 'circuitmaintenance', maintenance.pk),
-                (ObjectChangeActionChoices.ACTION_UPDATE, 'circuitmaintenance', maintenance.pk),
+                (ObjectChangeActionChoices.ACTION_CREATE, 'circuitmaintenance', maintenance_pk),
+                (ObjectChangeActionChoices.ACTION_UPDATE, 'circuitmaintenance', maintenance_pk),
+                (ObjectChangeActionChoices.ACTION_DELETE, 'circuitmaintenance', maintenance_pk),
             ],
         )
 
     def test_docs_url(self):
         self.assertIsNone(Note().docs_url)
+
+    def test_get_absolute_url(self):
+        note = Note.objects.create(maintenance=self.maintenances[0], title='Note 1', comment='comment 1')
+
+        self.assertEqual(note.get_absolute_url(), f'/plugins/circuit-maintenance/notes/{note.pk}/')
+
+    def test_clone_fields(self):
+        # The title is unique per maintenance and the comment is free text, so neither is cloned
+        note = Note.objects.create(
+            maintenance=self.maintenances[0], title='Note 1', level=NoteLevelChoices.WARNING, comment='comment 1'
+        )
+
+        self.assertEqual(
+            prepare_cloned_fields(note).dict(),
+            {'maintenance': str(self.maintenances[0].pk), 'level': NoteLevelChoices.WARNING},
+        )
 
     def test_features(self):
         features = set(ObjectType.objects.get_for_model(Note).features)

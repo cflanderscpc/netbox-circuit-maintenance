@@ -4,9 +4,9 @@ from circuits.models import Circuit, CircuitType, Provider
 from django.test import TestCase, override_settings
 from utilities.testing import ChangeLoggedFilterSetTests
 
-from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from netbox_circuit_maintenance.filtersets import CircuitImpactFilterSet, CircuitMaintenanceFilterSet
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance
+from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.filtersets import CircuitImpactFilterSet, CircuitMaintenanceFilterSet, NoteFilterSet
+from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -174,3 +174,56 @@ class CircuitImpactTestCase(TestCase, ChangeLoggedFilterSetTests):
     def test_impact(self):
         params = {'impact': [CircuitImpactChoices.NO_IMPACT, CircuitImpactChoices.OUTAGE]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+
+@override_settings(TIME_ZONE='UTC')
+class NoteTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = Note.objects.all()
+    filterset = NoteFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(
+                name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
+            ),
+        )
+
+        Note.objects.bulk_create(
+            (
+                Note(maintenance=cls.maintenances[0], title='Note 1', comment='foobar1'),
+                Note(
+                    maintenance=cls.maintenances[0],
+                    title='Note 2',
+                    level=NoteLevelChoices.WARNING,
+                    comment='foobar2',
+                ),
+                # The same title on another maintenance
+                Note(maintenance=cls.maintenances[1], title='Note 2', comment='foobar3'),
+            )
+        )
+
+    def test_q(self):
+        self.assertEqual(self.filterset({'q': 'Note 2'}, self.queryset).qs.count(), 2)
+        self.assertEqual(self.filterset({'q': 'foobar3'}, self.queryset).qs.count(), 1)
+
+    def test_maintenance(self):
+        params = {'maintenance_id': [self.maintenances[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'maintenance': [self.maintenances[1].name]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_title(self):
+        params = {'title': ['Note 1', 'Note 2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        self.assertEqual(self.filterset({'title__ic': ['te 1']}, self.queryset).qs.count(), 1)
+
+    def test_level(self):
+        params = {'level': [NoteLevelChoices.WARNING]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_comment(self):
+        params = {'comment': ['foobar1', 'foobar2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        self.assertEqual(self.filterset({'comment__ic': ['bar3']}, self.queryset).qs.count(), 1)

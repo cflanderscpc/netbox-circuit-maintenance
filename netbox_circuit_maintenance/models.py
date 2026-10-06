@@ -183,6 +183,9 @@ class Note(NetBoxModel):
         verbose_name=_('comment'),
     )
 
+    clone_fields = ('maintenance', 'level')
+    prerequisite_models = ('netbox_circuit_maintenance.CircuitMaintenance',)
+
     class Meta:
         ordering = ['last_updated', 'pk']
         constraints = (

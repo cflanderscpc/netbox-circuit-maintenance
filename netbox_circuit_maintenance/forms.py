@@ -14,6 +14,7 @@ from netbox.forms import (
 from utilities.forms import add_blank_choice
 from utilities.forms.constants import BOOLEAN_WITH_BLANK_CHOICES
 from utilities.forms.fields import (
+    CommentField,
     CSVChoiceField,
     CSVModelChoiceField,
     DynamicModelChoiceField,
@@ -23,8 +24,9 @@ from utilities.forms.fields import (
 from utilities.forms.rendering import FieldSet
 from utilities.forms.widgets import BulkEditNullBooleanSelect, DateTimePicker
 
-from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from .models import CircuitImpact, CircuitMaintenance
+from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from .constants import MAX_NOTE_TITLE_LENGTH
+from .models import CircuitImpact, CircuitMaintenance, Note
 
 __all__ = (
     'CircuitImpactBulkEditForm',
@@ -35,6 +37,10 @@ __all__ = (
     'CircuitMaintenanceFilterForm',
     'CircuitMaintenanceForm',
     'CircuitMaintenanceImportForm',
+    'NoteBulkEditForm',
+    'NoteFilterForm',
+    'NoteForm',
+    'NoteImportForm',
 )
 
 
@@ -215,6 +221,95 @@ class CircuitImpactFilterForm(NetBoxModelFilterSetForm):
     impact = forms.MultipleChoiceField(
         label=_('Impact'),
         choices=CircuitImpactChoices,
+        required=False,
+    )
+    tag = TagFilterField(model)
+
+
+#
+# Note
+#
+
+
+class NoteForm(NetBoxModelForm):
+    # Pre-filled from ?maintenance=<pk> when added from a maintenance's page
+    maintenance = DynamicModelChoiceField(
+        label=_('Maintenance'),
+        queryset=CircuitMaintenance.objects.all(),
+    )
+    comment = CommentField(
+        label=_('Comment'),
+        required=True,
+    )
+
+    fieldsets = (FieldSet('maintenance', 'title', 'level', 'comment', 'tags', name=_('Note')),)
+
+    class Meta:
+        model = Note
+        fields = ('maintenance', 'title', 'level', 'comment', 'tags')
+
+
+class NoteBulkEditForm(NetBoxModelBulkEditForm):
+    title = forms.CharField(
+        label=_('Title'),
+        max_length=MAX_NOTE_TITLE_LENGTH,
+        required=False,
+    )
+    level = forms.ChoiceField(
+        label=_('Level'),
+        choices=add_blank_choice(NoteLevelChoices),
+        required=False,
+        initial='',
+    )
+    comment = CommentField(
+        label=_('Comment'),
+    )
+
+    model = Note
+    fieldsets = (FieldSet('title', 'level', 'comment'),)
+
+
+class NoteImportForm(NetBoxModelImportForm):
+    maintenance = CSVModelChoiceField(
+        label=_('Maintenance'),
+        queryset=CircuitMaintenance.objects.all(),
+        to_field_name='name',
+        help_text=_('Name of the maintenance'),
+    )
+    level = CSVChoiceField(
+        label=_('Level'),
+        choices=NoteLevelChoices,
+        required=False,
+        help_text=_('Note level (default: Info)'),
+    )
+
+    class Meta:
+        model = Note
+        fields = ('maintenance', 'title', 'level', 'comment', 'tags')
+
+
+class NoteFilterForm(NetBoxModelFilterSetForm):
+    model = Note
+    fieldsets = (
+        FieldSet('q', 'filter_id', 'tag'),
+        FieldSet('maintenance_id', 'title', 'level', 'comment', name=_('Attributes')),
+    )
+    maintenance_id = DynamicModelMultipleChoiceField(
+        queryset=CircuitMaintenance.objects.all(),
+        required=False,
+        label=_('Maintenance'),
+    )
+    title = forms.CharField(
+        label=_('Title'),
+        required=False,
+    )
+    level = forms.MultipleChoiceField(
+        label=_('Level'),
+        choices=NoteLevelChoices,
+        required=False,
+    )
+    comment = forms.CharField(
+        label=_('Comment'),
         required=False,
     )
     tag = TagFilterField(model)

@@ -27,3 +27,9 @@ class CircuitImpactPanel(panels.ObjectAttributesPanel):
     provider = attrs.RelatedObjectAttr('circuit.provider', linkify=True)
     circuit = attrs.RelatedObjectAttr('circuit', linkify=True)
     impact = attrs.ChoiceAttr('impact')
+
+
+class NotePanel(panels.ObjectAttributesPanel):
+    maintenance = attrs.RelatedObjectAttr('maintenance', linkify=True)
+    title = attrs.TextAttr('title')
+    level = attrs.ChoiceAttr('level')

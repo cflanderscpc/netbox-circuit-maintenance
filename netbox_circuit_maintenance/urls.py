@@ -20,4 +20,12 @@ urlpatterns = [
         'circuit-impacts/<int:pk>/',
         include(get_model_urls('netbox_circuit_maintenance', 'circuitimpact')),
     ),
+    path(
+        'notes/',
+        include(get_model_urls('netbox_circuit_maintenance', 'note', detail=False)),
+    ),
+    path(
+        'notes/<int:pk>/',
+        include(get_model_urls('netbox_circuit_maintenance', 'note')),
+    ),
 ]

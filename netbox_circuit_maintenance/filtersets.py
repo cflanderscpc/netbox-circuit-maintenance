@@ -6,12 +6,13 @@ from netbox.filtersets import NetBoxModelFilterSet, PrimaryModelFilterSet
 from utilities.filters import MultiValueCharFilter
 from utilities.filtersets import register_filterset
 
-from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from .models import CircuitImpact, CircuitMaintenance
+from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from .models import CircuitImpact, CircuitMaintenance, Note
 
 __all__ = (
     'CircuitImpactFilterSet',
     'CircuitMaintenanceFilterSet',
+    'NoteFilterSet',
 )
 
 
@@ -100,3 +101,35 @@ class CircuitImpactFilterSet(NetBoxModelFilterSet):
         if not value.strip():
             return queryset
         return queryset.filter(Q(maintenance__name__icontains=value) | Q(circuit__cid__icontains=value))
+
+
+@register_filterset
+class NoteFilterSet(NetBoxModelFilterSet):
+    maintenance_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=CircuitMaintenance.objects.all(),
+        distinct=False,
+        label=_('Maintenance (ID)'),
+    )
+    maintenance = django_filters.ModelMultipleChoiceFilter(
+        field_name='maintenance__name',
+        queryset=CircuitMaintenance.objects.all(),
+        distinct=False,
+        to_field_name='name',
+        label=_('Maintenance (name)'),
+    )
+    level = django_filters.MultipleChoiceFilter(
+        choices=NoteLevelChoices,
+        distinct=False,
+        null_value=None,
+    )
+    # A TextField would otherwise get no filter
+    comment = MultiValueCharFilter()
+
+    class Meta:
+        model = Note
+        fields = ('id', 'title', 'comment')
+
+    def search(self, queryset, name, value):
+        if not value.strip():
+            return queryset
+        return queryset.filter(Q(title__icontains=value) | Q(comment__icontains=value))

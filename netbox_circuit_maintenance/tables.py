@@ -2,11 +2,12 @@ import django_tables2 as tables
 from django.utils.translation import gettext_lazy as _
 from netbox.tables import NetBoxTable, PrimaryModelTable, columns
 
-from .models import CircuitImpact, CircuitMaintenance
+from .models import CircuitImpact, CircuitMaintenance, Note
 
 __all__ = (
     'CircuitImpactTable',
     'CircuitMaintenanceTable',
+    'NoteTable',
 )
 
 
@@ -127,3 +128,40 @@ class CircuitImpactTable(NetBoxTable):
         )
         # Also sets the column order on the maintenance's Circuits panel: include_columns shows columns, it doesn't move them
         default_columns = ('pk', 'maintenance', 'circuit', 'impact', 'provider')
+
+
+class NoteTable(NetBoxTable):
+    maintenance = tables.Column(
+        verbose_name=_('Maintenance'),
+        linkify=True,
+    )
+    level = columns.ChoiceFieldColumn(
+        verbose_name=_('Level'),
+    )
+    title = tables.Column(
+        verbose_name=_('Title'),
+        linkify=True,
+    )
+    comment = columns.MarkdownColumn(
+        verbose_name=_('Comment'),
+    )
+    tags = columns.TagColumn(
+        url_name='plugins:netbox_circuit_maintenance:note_list',
+    )
+
+    class Meta(NetBoxTable.Meta):
+        model = Note
+        fields = (
+            'pk',
+            'id',
+            'maintenance',
+            'level',
+            'title',
+            'comment',
+            'tags',
+            'created',
+            'last_updated',
+            'actions',
+        )
+        # The maintenance's Notes panel order, which also sets the list's (include_columns doesn't move columns)
+        default_columns = ('pk', 'maintenance', 'level', 'title', 'last_updated', 'comment')

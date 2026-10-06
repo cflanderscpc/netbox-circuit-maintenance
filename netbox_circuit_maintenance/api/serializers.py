@@ -2,12 +2,13 @@ from circuits.api.serializers import CircuitSerializer
 from netbox.api.fields import ChoiceField
 from netbox.api.serializers import NetBoxModelSerializer, PrimaryModelSerializer
 
-from ..choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from ..models import CircuitImpact, CircuitMaintenance
+from ..choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from ..models import CircuitImpact, CircuitMaintenance, Note
 
 __all__ = (
     'CircuitImpactSerializer',
     'CircuitMaintenanceSerializer',
+    'NoteSerializer',
 )
 
 
@@ -64,3 +65,29 @@ class CircuitImpactSerializer(NetBoxModelSerializer):
             'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'maintenance', 'circuit', 'impact')
+
+
+class NoteSerializer(NetBoxModelSerializer):
+    maintenance = CircuitMaintenanceSerializer(nested=True)
+    level = ChoiceField(
+        choices=NoteLevelChoices,
+        required=False,
+    )
+
+    class Meta:
+        model = Note
+        fields = (
+            'id',
+            'url',
+            'display_url',
+            'display',
+            'maintenance',
+            'title',
+            'level',
+            'comment',
+            'tags',
+            'custom_fields',
+            'created',
+            'last_updated',
+        )
+        brief_fields = ('id', 'url', 'display', 'maintenance', 'title', 'level')

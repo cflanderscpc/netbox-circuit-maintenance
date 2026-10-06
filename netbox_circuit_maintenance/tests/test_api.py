@@ -5,8 +5,8 @@ from django.urls import reverse
 from rest_framework import status
 from utilities.testing import APITestCase, APIViewTestCases
 
-from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance
+from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, Note
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -43,8 +43,7 @@ class CircuitMaintenanceTest(
 
     @classmethod
     def setUpTestData(cls):
-        # No notes or parsed notifications: deleting a maintenance cascades to them, and they have no REST serializer
-        # yet
+        # No parsed notifications: deleting a maintenance cascades to them, and they have no REST serializer yet
         CircuitMaintenance.objects.bulk_create(
             (
                 CircuitMaintenance(name='UT-TEST-1', start_time=START, end_time=END),
@@ -200,3 +199,89 @@ class CircuitImpactTest(
         self.assertEqual(
             response.data, {'__all__': ['Circuit impact with this Maintenance and Circuit already exists.']}
         )
+
+
+# GraphQLTestCase is left out until the GraphQL rows are ported (Decisions 2026-10-06)
+class NoteTest(
+    APIViewTestCases.GetObjectViewTestCase,
+    APIViewTestCases.ListObjectsViewTestCase,
+    APIViewTestCases.CreateObjectViewTestCase,
+    APIViewTestCases.UpdateObjectViewTestCase,
+    APIViewTestCases.DeleteObjectViewTestCase,
+):
+    model = Note
+    view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    brief_fields = ['display', 'id', 'level', 'maintenance', 'title', 'url']
+    update_data = {
+        'title': 'Note 7',
+        'level': NoteLevelChoices.WARNING,
+        'comment': 'New comment',
+    }
+    bulk_update_data = {
+        'level': NoteLevelChoices.WARNING,
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.maintenances = (
+            CircuitMaintenance(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance(
+                name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
+            ),
+        )
+        CircuitMaintenance.objects.bulk_create(cls.maintenances)
+
+        Note.objects.bulk_create(
+            (
+                Note(maintenance=cls.maintenances[0], title='Note 1', comment='comment 1'),
+                Note(maintenance=cls.maintenances[0], title='Note 2', comment='comment 2'),
+                Note(maintenance=cls.maintenances[0], title='Note 3', comment='comment 3'),
+            )
+        )
+
+        cls.create_data = [
+            {
+                'maintenance': cls.maintenances[1].pk,
+                'title': 'Note 4',
+                'level': NoteLevelChoices.WARNING,
+                'comment': 'comment 4',
+            },
+            {
+                'maintenance': cls.maintenances[1].pk,
+                'title': 'Note 5',
+                'comment': 'comment 5',
+            },
+            # The same title on another maintenance
+            {
+                'maintenance': cls.maintenances[1].pk,
+                'title': 'Note 1',
+                'level': NoteLevelChoices.INFO,
+                'comment': 'comment 6',
+            },
+        ]
+
+    def test_create_object_default_level(self):
+        self.add_permissions('netbox_circuit_maintenance.add_note')
+
+        response = self.client.post(self._get_list_url(), self.create_data[1], format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['level']['value'], NoteLevelChoices.INFO)
+
+    def test_create_object_duplicate(self):
+        # The (maintenance, title) constraint is validated, not left to the database
+        self.add_permissions('netbox_circuit_maintenance.add_note')
+        data = {'maintenance': self.maintenances[0].pk, 'title': 'Note 1', 'comment': 'comment 7'}
+
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data, {'__all__': ['Note with this Maintenance and Title already exists.']})
+
+    def test_list_objects_filtered(self):
+        # Nautobot's note API had no filterset
+        self.add_permissions('netbox_circuit_maintenance.view_note')
+
+        response = self.client.get(
+            self._get_list_url(), {'maintenance_id': self.maintenances[0].pk, 'q': 'Note 2'}, **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual([note['title'] for note in response.data['results']], ['Note 2'])

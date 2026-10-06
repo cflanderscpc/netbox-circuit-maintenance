@@ -9,8 +9,14 @@ from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
 from users.models import ObjectPermission
 from utilities.testing import ViewTestCases, create_tags, post_data
 
-from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices
-from netbox_circuit_maintenance.models import CircuitImpact, CircuitMaintenance, ParsedNotification, RawNotification
+from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.models import (
+    CircuitImpact,
+    CircuitMaintenance,
+    Note,
+    ParsedNotification,
+    RawNotification,
+)
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -27,9 +33,9 @@ class CircuitMaintenanceTestCase(PluginViewTestMixin, ViewTestCases.PrimaryObjec
 
     @classmethod
     def setUpTestData(cls):
-        # No notes or parsed notifications: a maintenance delete cascades to them, and under event tracking each deleted
-        # object needs a REST serializer, which those models don't have yet. Impacts are covered by
-        # test_delete_object_with_impacts.
+        # No parsed notifications: a maintenance delete cascades to them, and under event tracking each deleted object
+        # needs a REST serializer, which that model doesn't have yet. Impacts and notes are covered by
+        # test_delete_object_with_impacts_and_notes.
         maintenances = (
             CircuitMaintenance(name='UT-TEST-1', start_time=START, end_time=END),
             CircuitMaintenance(
@@ -184,22 +190,53 @@ class CircuitMaintenanceTestCase(PluginViewTestMixin, ViewTestCases.PrimaryObjec
         self.assertNotContains(response, f'maintenance_id={maintenance.pk}')
         self.assertNotContains(response, reverse('plugins:netbox_circuit_maintenance:circuitimpact_add'))
 
+    def test_get_object_notes_panel(self):
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_circuitmaintenance',
+            'netbox_circuit_maintenance.view_note',
+            'netbox_circuit_maintenance.add_note',
+        )
+
+        response = self.client.get(maintenance.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Notes')
+        # The table loads over HTMX from the note list, filtered to this maintenance
+        list_url = reverse('plugins:netbox_circuit_maintenance:note_list')
+        self.assertContains(response, f'{list_url}?embedded=True&maintenance_id={maintenance.pk}')
+        # Add pre-fills the maintenance and returns to its page
+        add_url = reverse('plugins:netbox_circuit_maintenance:note_add')
+        self.assertContains(response, f'{add_url}?maintenance={maintenance.pk}&amp;return_url=')
+
+    def test_get_object_notes_panel_hidden_without_permission(self):
+        # Panel and Add button gate on Note's own permissions, not the maintenance's
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        response = self.client.get(maintenance.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, reverse('plugins:netbox_circuit_maintenance:note_list'))
+        self.assertNotContains(response, reverse('plugins:netbox_circuit_maintenance:note_add'))
+
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
-    def test_delete_object_with_impacts(self):
+    def test_delete_object_with_impacts_and_notes(self):
         maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
         provider = Provider.objects.create(name='Provider 1', slug='provider-1')
         circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
         circuit = Circuit.objects.create(cid='CID-1', provider=provider, type=circuit_type)
         impact = CircuitImpact.objects.create(maintenance=maintenance, circuit=circuit)
+        note = Note.objects.create(maintenance=maintenance, title='Note 1', comment='comment 1')
         self.add_permissions('netbox_circuit_maintenance.delete_circuitmaintenance')
 
-        # The confirmation lists the impact with a link, and the delete serializes it for events
+        # The confirmation lists the impact and the note with links, and the delete serializes them for events
         response = self.client.get(self._get_url('delete', maintenance))
         self.assertHttpStatus(response, 200)
         self.assertContains(response, impact.get_absolute_url())
+        self.assertContains(response, note.get_absolute_url())
         response = self.client.post(self._get_url('delete', maintenance), post_data({'confirm': True}))
         self.assertHttpStatus(response, 302)
         self.assertFalse(CircuitImpact.objects.filter(pk=impact.pk).exists())
+        self.assertFalse(Note.objects.filter(pk=note.pk).exists())
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_get_object_changelog_with_impact(self):
@@ -220,6 +257,23 @@ class CircuitMaintenanceTestCase(PluginViewTestMixin, ViewTestCases.PrimaryObjec
         response = self.client.get(self._get_url('changelog', maintenance))
         self.assertHttpStatus(response, 200)
         self.assertContains(response, f'<a href="{impact.get_absolute_url()}">{impact}</a>', html=True)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_get_object_changelog_with_note(self):
+        # A note added through the UI is listed in the maintenance's changelog, linked to the note
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
+        self.add_permissions('netbox_circuit_maintenance.add_note')
+
+        response = self.client.post(
+            reverse('plugins:netbox_circuit_maintenance:note_add'),
+            post_data({'maintenance': maintenance.pk, 'title': 'Note 1', 'level': 'INFO', 'comment': 'comment 1'}),
+        )
+        self.assertHttpStatus(response, 302)
+        note = Note.objects.get(maintenance=maintenance, title='Note 1')
+
+        response = self.client.get(self._get_url('changelog', maintenance))
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, f'<a href="{note.get_absolute_url()}">{note}</a>', html=True)
 
 
 class CircuitImpactTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObjectViewTestCase):
@@ -401,3 +455,144 @@ class CircuitImpactTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObj
         )
         self.assertHttpStatus(response, 302)
         self.assertFalse(CircuitImpact.objects.filter(circuit_id=circuit.pk).exists())
+
+
+class NoteTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObjectViewTestCase):
+    model = Note
+
+    @classmethod
+    def setUpTestData(cls):
+        maintenances = (
+            CircuitMaintenance(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance(
+                name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
+            ),
+        )
+        CircuitMaintenance.objects.bulk_create(maintenances)
+
+        notes = (
+            Note(maintenance=maintenances[0], title='Note 0', comment='comment 0'),
+            Note(maintenance=maintenances[0], title='Note 1', comment='comment 1'),
+            Note(maintenance=maintenances[0], title='Note 2', comment='comment 2'),
+        )
+        Note.objects.bulk_create(notes)
+
+        tags = create_tags('Alpha', 'Bravo', 'Charlie')
+
+        cls.form_data = {
+            'maintenance': maintenances[0].pk,
+            'title': 'Note 3',
+            'level': NoteLevelChoices.INFO,
+            'comment': 'comment 3',
+            'tags': [t.pk for t in tags],
+        }
+
+        cls.csv_data = {
+            'default': (
+                'maintenance,title,level,comment',
+                f'{maintenances[0].name},Note 4,INFO,comment 4',
+                f'{maintenances[0].name},Note 5,INFO,comment 5',
+                f'{maintenances[0].name},Note 6,WARNING,comment 6',
+            ),
+            # Level defaults to INFO, as with Nautobot's serializer-based import
+            'without_level': (
+                'maintenance,title,comment',
+                f'{maintenances[1].name},Note 7,comment 7',
+                f'{maintenances[1].name},Note 8,comment 8',
+            ),
+        }
+
+        cls.csv_update_data = (
+            'id,level,comment',
+            f'{notes[0].pk},WARNING,New comment 0',
+            f'{notes[1].pk},WARNING,New comment 1',
+            f'{notes[2].pk},INFO,New comment 2',
+        )
+
+        cls.bulk_edit_data = {
+            'level': NoteLevelChoices.WARNING,
+        }
+
+    def _import(self, data):
+        return self.client.post(
+            self._get_url('bulk_import'),
+            {'data': data, 'format': ImportFormatChoices.CSV, 'csv_delimiter': CSVDelimiterChoices.AUTO},
+        )
+
+    # The import form only offers maintenances the user can view
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_bulk_import_default_level(self):
+        self.add_permissions('netbox_circuit_maintenance.add_note')
+
+        self.assertHttpStatus(self._import('\n'.join(self.csv_data['without_level'])), 302)
+        note = Note.objects.get(maintenance__name='UT-TEST-2', title='Note 7')
+        self.assertEqual(note.level, NoteLevelChoices.INFO)
+
+        # A blank cell counts as omitted (NetBox's CSVSelectWidget)
+        self.assertHttpStatus(self._import('maintenance,title,level,comment\nUT-TEST-2,Note 9,,comment 9'), 302)
+        note = Note.objects.get(maintenance__name='UT-TEST-2', title='Note 9')
+        self.assertEqual(note.level, NoteLevelChoices.INFO)
+
+    # The import form only offers maintenances the user can view
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_bulk_import_duplicate_title(self):
+        self.add_permissions('netbox_circuit_maintenance.add_note')
+
+        response = self._import('maintenance,title,comment\nUT-TEST-1,Note 0,comment')
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Note with this Maintenance and Title already exists.')
+
+    def test_bulk_edit_duplicate_title(self):
+        # One title for two notes of the same maintenance fails validation and changes nothing
+        notes = Note.objects.filter(title__in=('Note 0', 'Note 1'))
+        self.add_permissions('netbox_circuit_maintenance.view_note', 'netbox_circuit_maintenance.change_note')
+
+        response = self.client.post(
+            self._get_url('bulk_edit'),
+            {'pk': [note.pk for note in notes], '_apply': True, 'title': 'Same title'},
+        )
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Note with this Maintenance and Title already exists.')
+        self.assertFalse(Note.objects.filter(title='Same title').exists())
+
+    def test_create_object_prefilled_maintenance(self):
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-2')
+        self.add_permissions('netbox_circuit_maintenance.add_note')
+
+        response = self.client.get(self._get_url('add'), {'maintenance': maintenance.pk})
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(response.context['form']['maintenance'].value(), str(maintenance.pk))
+
+    def test_get_object_comment_markdown(self):
+        note = Note.objects.get(title='Note 0')
+        note.comment = 'Circuit **CID-1** <script>alert(1)</script>'
+        note.save()
+        self.add_permissions('netbox_circuit_maintenance.view_note')
+
+        response = self.client.get(note.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, '<strong>CID-1</strong>', html=True)
+        self.assertNotContains(response, '<script>alert(1)</script>')
+
+    def test_list_objects_panel_columns(self):
+        # The columns the maintenance's Notes panel asks for, in Nautobot's panel order
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
+        self.add_permissions('netbox_circuit_maintenance.view_note')
+
+        response = self.client.get(
+            self._get_url('list'),
+            {
+                'maintenance_id': maintenance.pk,
+                'include_columns': 'level,title,last_updated,comment',
+                'exclude_columns': 'maintenance',
+            },
+        )
+        self.assertHttpStatus(response, 200)
+        table = response.context['table']
+        # Least recently updated first (no pk checkbox: this user has no bulk actions)
+        self.assertEqual([note.title for note in table.data], ['Note 0', 'Note 1', 'Note 2'])
+        self.assertEqual(
+            [column.name for column in table.columns if column.visible],
+            ['level', 'title', 'last_updated', 'comment', 'actions'],
+        )
+        self.assertNotContains(response, maintenance.get_absolute_url())

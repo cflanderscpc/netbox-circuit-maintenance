@@ -7,7 +7,7 @@ from netbox.views import generic
 from utilities.views import register_model_view
 
 from . import filtersets, forms, tables
-from .models import CircuitImpact, CircuitMaintenance
+from .models import CircuitImpact, CircuitMaintenance, Note
 from .ui import panels
 
 #
@@ -56,6 +56,19 @@ class CircuitMaintenanceView(generic.ObjectView):
                 actions=[
                     actions.AddObject(
                         'netbox_circuit_maintenance.CircuitImpact',
+                        url_params={'maintenance': lambda ctx: ctx['object'].pk},
+                    ),
+                ],
+            ),
+            ObjectsTablePanel(
+                model='netbox_circuit_maintenance.Note',
+                title=_('Notes'),
+                filters={'maintenance_id': lambda ctx: ctx['object'].pk},
+                include_columns=['level', 'title', 'last_updated', 'comment'],
+                exclude_columns=['maintenance'],
+                actions=[
+                    actions.AddObject(
+                        'netbox_circuit_maintenance.Note',
                         url_params={'maintenance': lambda ctx: ctx['object'].pk},
                     ),
                 ],
@@ -157,3 +170,66 @@ class CircuitImpactBulkDeleteView(generic.BulkDeleteView):
     queryset = CircuitImpact.objects.all()
     filterset = filtersets.CircuitImpactFilterSet
     table = tables.CircuitImpactTable
+
+
+#
+# Note
+#
+
+
+@register_model_view(Note, 'list', path='', detail=False)
+class NoteListView(generic.ObjectListView):
+    queryset = Note.objects.all()
+    filterset = filtersets.NoteFilterSet
+    filterset_form = forms.NoteFilterForm
+    table = tables.NoteTable
+    actions = (AddObject, BulkImport, BulkExport, BulkEdit, BulkDelete)
+
+
+@register_model_view(Note)
+class NoteView(generic.ObjectView):
+    queryset = Note.objects.all()
+    template_name = 'generic/object.html'
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.NotePanel(),
+            CustomFieldsPanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            CommentsPanel(field_name='comment', title=_('Comment')),
+        ],
+    )
+
+
+@register_model_view(Note, 'add', detail=False)
+@register_model_view(Note, 'edit')
+class NoteEditView(generic.ObjectEditView):
+    queryset = Note.objects.all()
+    form = forms.NoteForm
+
+
+@register_model_view(Note, 'delete')
+class NoteDeleteView(generic.ObjectDeleteView):
+    queryset = Note.objects.all()
+
+
+@register_model_view(Note, 'bulk_import', path='import', detail=False)
+class NoteBulkImportView(generic.BulkImportView):
+    queryset = Note.objects.all()
+    model_form = forms.NoteImportForm
+
+
+@register_model_view(Note, 'bulk_edit', path='edit', detail=False)
+class NoteBulkEditView(generic.BulkEditView):
+    queryset = Note.objects.all()
+    filterset = filtersets.NoteFilterSet
+    table = tables.NoteTable
+    form = forms.NoteBulkEditForm
+
+
+@register_model_view(Note, 'bulk_delete', path='delete', detail=False)
+class NoteBulkDeleteView(generic.BulkDeleteView):
+    queryset = Note.objects.all()
+    filterset = filtersets.NoteFilterSet
+    table = tables.NoteTable
