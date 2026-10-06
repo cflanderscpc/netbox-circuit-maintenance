@@ -128,6 +128,13 @@ class CircuitMaintenanceTestCase(TestCase):
         # None hides the edit form's Help button, which would link to a missing NetBox core docs page
         self.assertIsNone(CircuitMaintenance().docs_url)
 
+    def test_get_absolute_url(self):
+        maintenance = CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END)
+
+        self.assertEqual(
+            maintenance.get_absolute_url(), f'/plugins/circuit-maintenance/circuit-maintenances/{maintenance.pk}/'
+        )
+
     def test_features(self):
         features = set(ObjectType.objects.get_for_model(CircuitMaintenance).features)
 

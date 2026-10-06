@@ -1,0 +1,116 @@
+from circuits.models import Circuit, Provider
+from django import forms
+from django.utils.translation import gettext_lazy as _
+from netbox.forms import PrimaryModelBulkEditForm, PrimaryModelFilterSetForm, PrimaryModelForm, PrimaryModelImportForm
+from utilities.forms import add_blank_choice
+from utilities.forms.constants import BOOLEAN_WITH_BLANK_CHOICES
+from utilities.forms.fields import CSVChoiceField, DynamicModelMultipleChoiceField, TagFilterField
+from utilities.forms.rendering import FieldSet
+from utilities.forms.widgets import BulkEditNullBooleanSelect, DateTimePicker
+
+from .choices import CircuitMaintenanceStatusChoices
+from .models import CircuitMaintenance
+
+__all__ = (
+    'CircuitMaintenanceBulkEditForm',
+    'CircuitMaintenanceFilterForm',
+    'CircuitMaintenanceForm',
+    'CircuitMaintenanceImportForm',
+)
+
+
+#
+# CircuitMaintenance
+#
+
+
+class CircuitMaintenanceForm(PrimaryModelForm):
+    fieldsets = (
+        FieldSet('name', 'status', 'start_time', 'end_time', 'ack', 'description', 'tags', name=_('Maintenance')),
+    )
+
+    class Meta:
+        model = CircuitMaintenance
+        fields = ('name', 'status', 'start_time', 'end_time', 'ack', 'description', 'owner', 'comments', 'tags')
+        widgets = {
+            'start_time': DateTimePicker(),
+            'end_time': DateTimePicker(),
+        }
+
+
+class CircuitMaintenanceBulkEditForm(PrimaryModelBulkEditForm):
+    status = forms.ChoiceField(
+        label=_('Status'),
+        choices=add_blank_choice(CircuitMaintenanceStatusChoices),
+        required=False,
+        initial='',
+    )
+    ack = forms.NullBooleanField(
+        label=_('Acknowledged'),
+        required=False,
+        widget=BulkEditNullBooleanSelect(),
+    )
+    # Overrides PrimaryModelBulkEditForm's 100-character limit: the model field is a TextField
+    description = forms.CharField(
+        label=_('Description'),
+        required=False,
+        widget=forms.Textarea(),
+    )
+
+    model = CircuitMaintenance
+    fieldsets = (FieldSet('status', 'ack', 'description'),)
+    nullable_fields = ('description', 'comments')
+
+
+class CircuitMaintenanceImportForm(PrimaryModelImportForm):
+    status = CSVChoiceField(
+        label=_('Status'),
+        choices=CircuitMaintenanceStatusChoices,
+        required=False,
+        help_text=_('Maintenance status (default: Tentative)'),
+    )
+
+    class Meta:
+        model = CircuitMaintenance
+        fields = ('name', 'status', 'start_time', 'end_time', 'ack', 'description', 'owner', 'comments', 'tags')
+
+
+class CircuitMaintenanceFilterForm(PrimaryModelFilterSetForm):
+    model = CircuitMaintenance
+    fieldsets = (
+        FieldSet('q', 'filter_id', 'tag'),
+        FieldSet('status', 'ack', 'start_time__gte', 'end_time__lte', name=_('Attributes')),
+        FieldSet('provider_id', 'circuit_id', name=_('Impact')),
+        FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
+    )
+    status = forms.MultipleChoiceField(
+        label=_('Status'),
+        choices=CircuitMaintenanceStatusChoices,
+        required=False,
+    )
+    ack = forms.NullBooleanField(
+        label=_('Acknowledged'),
+        required=False,
+        widget=forms.Select(choices=BOOLEAN_WITH_BLANK_CHOICES),
+    )
+    start_time__gte = forms.DateTimeField(
+        label=_('Start time after'),
+        required=False,
+        widget=DateTimePicker(),
+    )
+    end_time__lte = forms.DateTimeField(
+        label=_('End time before'),
+        required=False,
+        widget=DateTimePicker(),
+    )
+    provider_id = DynamicModelMultipleChoiceField(
+        queryset=Provider.objects.all(),
+        required=False,
+        label=_('Provider'),
+    )
+    circuit_id = DynamicModelMultipleChoiceField(
+        queryset=Circuit.objects.all(),
+        required=False,
+        label=_('Circuit'),
+    )
+    tag = TagFilterField(model)
