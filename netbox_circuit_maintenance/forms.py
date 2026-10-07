@@ -26,7 +26,7 @@ from utilities.forms.widgets import BulkEditNullBooleanSelect, DateTimePicker
 
 from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
 from .constants import MAX_NOTE_TITLE_LENGTH
-from .models import CircuitImpact, CircuitMaintenance, Note, RawNotification
+from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, RawNotification
 
 __all__ = (
     'CircuitImpactBulkEditForm',
@@ -41,6 +41,8 @@ __all__ = (
     'NoteFilterForm',
     'NoteForm',
     'NoteImportForm',
+    'NotificationSourceFilterForm',
+    'NotificationSourceForm',
     'RawNotificationFilterForm',
 )
 
@@ -317,16 +319,41 @@ class NoteFilterForm(NetBoxModelFilterSetForm):
 
 
 #
+# NotificationSource
+#
+
+
+class NotificationSourceForm(NetBoxModelForm):
+    providers = DynamicModelMultipleChoiceField(
+        label=_('Providers'),
+        queryset=Provider.objects.all(),
+        required=False,
+    )
+
+    # The name and attach_all_providers come from the plugin configuration
+    fieldsets = (FieldSet('providers', 'tags', name=_('Notification Source')),)
+
+    class Meta:
+        model = NotificationSource
+        fields = ('providers', 'tags')
+
+
+class NotificationSourceFilterForm(NetBoxModelFilterSetForm):
+    model = NotificationSource
+    fieldsets = (FieldSet('q', 'filter_id', 'tag'),)
+    tag = TagFilterField(model)
+
+
+#
 # RawNotification
 #
 
 
 class RawNotificationFilterForm(NetBoxModelFilterSetForm):
     model = RawNotification
-    # No source field until NotificationSource has a REST API: the dynamic dropdown reverses its list endpoint
     fieldsets = (
         FieldSet('q', 'filter_id', 'tag'),
-        FieldSet('provider_id', 'sender', 'parsed', 'since', name=_('Attributes')),
+        FieldSet('provider_id', 'sender', 'source_id', 'parsed', 'since', name=_('Attributes')),
     )
     provider_id = DynamicModelMultipleChoiceField(
         queryset=Provider.objects.all(),
@@ -336,6 +363,11 @@ class RawNotificationFilterForm(NetBoxModelFilterSetForm):
     sender = forms.CharField(
         label=_('Sender'),
         required=False,
+    )
+    source_id = DynamicModelMultipleChoiceField(
+        queryset=NotificationSource.objects.all(),
+        required=False,
+        label=_('Source'),
     )
     parsed = forms.NullBooleanField(
         label=_('Parsed'),

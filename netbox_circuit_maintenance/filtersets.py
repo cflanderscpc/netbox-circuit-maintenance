@@ -13,6 +13,7 @@ __all__ = (
     'CircuitImpactFilterSet',
     'CircuitMaintenanceFilterSet',
     'NoteFilterSet',
+    'NotificationSourceFilterSet',
     'ParsedNotificationFilterSet',
     'RawNotificationFilterSet',
 )
@@ -135,6 +136,31 @@ class NoteFilterSet(NetBoxModelFilterSet):
         if not value.strip():
             return queryset
         return queryset.filter(Q(title__icontains=value) | Q(comment__icontains=value))
+
+
+@register_filterset
+class NotificationSourceFilterSet(NetBoxModelFilterSet):
+    provider_id = django_filters.ModelMultipleChoiceFilter(
+        field_name='providers',
+        queryset=Provider.objects.all(),
+        label=_('Provider (ID)'),
+    )
+    provider = django_filters.ModelMultipleChoiceFilter(
+        field_name='providers__slug',
+        queryset=Provider.objects.all(),
+        to_field_name='slug',
+        label=_('Provider (slug)'),
+    )
+
+    class Meta:
+        model = NotificationSource
+        # The OAuth token is never filterable
+        fields = ('id', 'name', 'attach_all_providers')
+
+    def search(self, queryset, name, value):
+        if not value.strip():
+            return queryset
+        return queryset.filter(name__icontains=value)
 
 
 @register_filterset

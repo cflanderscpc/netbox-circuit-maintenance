@@ -295,6 +295,68 @@ class NoteTest(
 
 
 # GraphQLTestCase is left out until the GraphQL rows are ported (Decisions 2026-10-06)
+class NotificationSourceTest(
+    APIViewTestCases.GetObjectViewTestCase,
+    APIViewTestCases.ListObjectsViewTestCase,
+):
+    model = NotificationSource
+    view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    brief_fields = ['display', 'id', 'name', 'url']
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider(name='Provider 1', slug='provider-1'),
+            Provider(name='Provider 2', slug='provider-2'),
+        )
+        Provider.objects.bulk_create(cls.providers)
+
+        sources = (
+            NotificationSource(name='Source 1', _token={'refresh_token': 'refresh-token-value'}),
+            NotificationSource(name='Source 2', attach_all_providers=True),
+            NotificationSource(name='Source 3'),
+        )
+        NotificationSource.objects.bulk_create(sources)
+        sources[0].providers.set(cls.providers[:1])
+        sources[1].providers.set(cls.providers)
+
+    def test_get_object_providers_without_token(self):
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.get(self._get_detail_url(source), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual([provider['id'] for provider in response.data['providers']], [self.providers[0].pk])
+        self.assertFalse(response.data['attach_all_providers'])
+        self.assertNotIn('_token', response.data)
+        self.assertNotContains(response, 'refresh-token-value')
+
+    def test_read_only(self):
+        # Sources come from the plugin configuration
+        source = NotificationSource.objects.first()
+        self.add_permissions(
+            'netbox_circuit_maintenance.add_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+            'netbox_circuit_maintenance.delete_notificationsource',
+        )
+
+        response = self.client.post(self._get_list_url(), {'name': 'Source 4'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+        response = self.client.patch(
+            self._get_detail_url(source), {'providers': [self.providers[1].pk]}, format='json', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+        response = self.client.delete(self._get_detail_url(source), **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_list_objects_filtered(self):
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.get(self._get_list_url(), {'provider': self.providers[1].slug}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual([item['name'] for item in response.data['results']], ['Source 2'])
+
+
 class RawNotificationTest(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
@@ -329,15 +391,22 @@ class RawNotificationTest(
         )
 
     def test_get_object_raw_and_source(self):
-        # raw is base64, as Nautobot's serializer returned it; source is the source's ID until it has a serializer
+        # raw is base64, as Nautobot's serializer returned it; source is a nested object, or null once deleted
         raw_notification = RawNotification.objects.get(subject='Subject 2')
         self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
 
         response = self.client.get(self._get_detail_url(raw_notification), **self.header)
         self.assertHttpStatus(response, status.HTTP_200_OK)
         self.assertEqual(response.data['raw'], 'Ym9keSAy')
-        self.assertEqual(response.data['source'], self.source.pk)
+        self.assertEqual(sorted(response.data['source']), ['display', 'id', 'name', 'url'])
+        self.assertEqual((response.data['source']['id'], response.data['source']['name']), (self.source.pk, 'Source 1'))
         self.assertEqual(response.data['provider']['id'], self.providers[1].pk)
+
+        response = self.client.get(
+            self._get_detail_url(RawNotification.objects.get(subject='Subject 1')), **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertIsNone(response.data['source'])
 
     def test_read_only(self):
         # Only the notification handler creates raw notifications, and nobody edits them

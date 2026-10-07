@@ -1,13 +1,13 @@
 from django.utils.translation import gettext_lazy as _
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
-from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport, DeleteObject
+from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport, DeleteObject, EditObject
 from netbox.ui import actions, layout
 from netbox.ui.panels import CommentsPanel, JSONPanel, ObjectsTablePanel
 from netbox.views import generic
 from utilities.views import register_model_view
 
 from . import filtersets, forms, tables
-from .models import CircuitImpact, CircuitMaintenance, Note, ParsedNotification, RawNotification
+from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
 from .ui import panels
 
 #
@@ -241,6 +241,49 @@ class NoteBulkDeleteView(generic.BulkDeleteView):
     queryset = Note.objects.all()
     filterset = filtersets.NoteFilterSet
     table = tables.NoteTable
+
+
+#
+# NotificationSource
+#
+
+# Sources mirror the plugin configuration, so they can't be added or imported (Decisions 2026-09-24)
+
+
+@register_model_view(NotificationSource, 'list', path='', detail=False)
+class NotificationSourceListView(generic.ObjectListView):
+    queryset = NotificationSource.objects.all()
+    filterset = filtersets.NotificationSourceFilterSet
+    filterset_form = forms.NotificationSourceFilterForm
+    table = tables.NotificationSourceTable
+    actions = (BulkExport,)
+
+
+@register_model_view(NotificationSource)
+class NotificationSourceView(generic.ObjectView):
+    queryset = NotificationSource.objects.all()
+    template_name = 'generic/object.html'
+    actions = (EditObject, DeleteObject)
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.NotificationSourcePanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            CustomFieldsPanel(),
+        ],
+    )
+
+
+@register_model_view(NotificationSource, 'edit')
+class NotificationSourceEditView(generic.ObjectEditView):
+    queryset = NotificationSource.objects.all()
+    form = forms.NotificationSourceForm
+
+
+@register_model_view(NotificationSource, 'delete')
+class NotificationSourceDeleteView(generic.ObjectDeleteView):
+    queryset = NotificationSource.objects.all()
 
 
 #

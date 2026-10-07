@@ -659,6 +659,128 @@ class NoteTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObjectViewTe
         self.assertNotContains(response, maintenance.get_absolute_url())
 
 
+class NotificationSourceTestCase(
+    PluginViewTestMixin,
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.GetObjectChangelogViewTestCase,
+    ViewTestCases.EditObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+):
+    model = NotificationSource
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider(name='Provider 3', slug='provider-3'),
+            Provider(name='Provider 4', slug='provider-4'),
+            Provider(name='Provider 5', slug='provider-5'),
+        )
+        Provider.objects.bulk_create(cls.providers)
+
+        sources = (
+            NotificationSource(name='Source 1'),
+            NotificationSource(name='Source 2', attach_all_providers=True),
+            NotificationSource(name='Source 3'),
+        )
+        NotificationSource.objects.bulk_create(sources)
+        sources[0].providers.set(cls.providers[:2])
+        sources[1].providers.set(cls.providers)
+
+        tags = create_tags('Alpha', 'Bravo', 'Charlie')
+
+        # The name and attach_all_providers come from the plugin configuration, so only these can be edited
+        cls.form_data = {
+            'providers': [cls.providers[2].pk],
+            'tags': [t.pk for t in tags],
+        }
+
+    def test_get_object_attributes(self):
+        source = NotificationSource.objects.get(name='Source 2')
+        source._token = {'refresh_token': 'refresh-token-value'}
+        source.save()
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.add_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+            'netbox_circuit_maintenance.delete_notificationsource',
+        )
+
+        response = self.client.get(source.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        for provider in self.providers:
+            self.assertContains(response, provider.get_absolute_url())
+        self.assertContains(response, 'Attach all providers')
+        self.assertContains(response, 'mdi-check-bold')
+        self.assertNotContains(response, 'refresh-token-value')
+        # Sources can be edited and deleted, but not added or cloned, whatever the user's permissions
+        self.assertContains(response, self._get_url('edit', source))
+        self.assertContains(response, self._get_url('delete', source))
+        self.assertNotContains(response, f'{self._get_url("list")}add/')
+
+    # The form only offers providers the user can view
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_edit_object_configured_fields(self):
+        # The form ignores the fields that come from the plugin configuration
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.change_notificationsource')
+
+        response = self.client.post(
+            self._get_url('edit', source),
+            post_data({'name': 'Renamed', 'attach_all_providers': True, 'providers': [self.providers[2].pk]}),
+        )
+        self.assertHttpStatus(response, 302)
+        source.refresh_from_db()
+        self.assertEqual((source.name, source.attach_all_providers), ('Source 1', False))
+        self.assertQuerySetEqual(source.providers.all(), [self.providers[2]])
+
+    def test_list_objects_filtered(self):
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.get(self._get_url('list'), {'provider_id': self.providers[2].pk})
+        self.assertHttpStatus(response, 200)
+        self.assertEqual([str(source) for source in response.context['table'].data], ['Source 2'])
+
+    def test_list_objects_actions(self):
+        # Export only: sources can't be added or imported, and have no bulk edit or bulk delete
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.add_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+            'netbox_circuit_maintenance.delete_notificationsource',
+        )
+
+        response = self.client.get(self._get_url('list'))
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Export')
+        for action in ('add', 'import', 'edit', 'delete'):
+            self.assertNotContains(response, f'{self._get_url("list")}{action}/')
+
+    def test_menu_item(self):
+        list_url = self._get_url('list')
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+        response = self.client.get(reverse('home'))
+        self.assertNotContains(response, f'href="{list_url}"')
+
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        response = self.client.get(reverse('home'))
+        self.assertContains(response, f'href="{list_url}"')
+
+    def test_delete_object_with_raw_notifications(self):
+        # The raw notifications stay, without a source
+        source = NotificationSource.objects.get(name='Source 1')
+        raw_notification = RawNotification.objects.create(
+            subject='Subject 1', provider=self.providers[0], source=source, raw=b'body', stamp=START
+        )
+        self.add_permissions('netbox_circuit_maintenance.delete_notificationsource')
+
+        response = self.client.post(self._get_url('delete', source), post_data({'confirm': True}))
+        self.assertHttpStatus(response, 302)
+        self.assertFalse(NotificationSource.objects.filter(pk=source.pk).exists())
+        raw_notification.refresh_from_db()
+        self.assertIsNone(raw_notification.source)
+
+
 class RawNotificationTestCase(
     PluginViewTestMixin,
     ViewTestCases.GetObjectViewTestCase,
@@ -715,7 +837,12 @@ class RawNotificationTestCase(
 
         response = self.client.get(raw_notification.get_absolute_url())
         self.assertHttpStatus(response, 200)
-        for text in ('Subject 1', 'noc@example.com', self.providers[0].get_absolute_url(), 'Source 1'):
+        for text in (
+            'Subject 1',
+            'noc@example.com',
+            self.providers[0].get_absolute_url(),
+            self.source.get_absolute_url(),
+        ):
             self.assertContains(response, text)
         # Raw notifications can only be deleted, whatever the user's permissions
         self.assertContains(response, self._get_url('delete', raw_notification))
@@ -783,6 +910,19 @@ class RawNotificationTestCase(
         )
         self.assertHttpStatus(response, 200)
         self.assertEqual([str(raw_notification) for raw_notification in response.context['table'].data], ['Subject 3'])
+
+    def test_list_objects_source(self):
+        # The source links to its page, and the filter form offers it (a dynamic field, which reverses the source's
+        # REST endpoint when it renders)
+        other_source = NotificationSource.objects.create(name='Source 2')
+        RawNotification.objects.filter(subject='Subject 3').update(source=other_source)
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+
+        response = self.client.get(self._get_url('list'), {'source_id': other_source.pk})
+        self.assertHttpStatus(response, 200)
+        self.assertEqual([str(raw_notification) for raw_notification in response.context['table'].data], ['Subject 3'])
+        self.assertContains(response, f'href="{other_source.get_absolute_url()}"')
+        self.assertIn('source_id', response.context['filter_form'].fields)
 
     def test_menu_item(self):
         # Gated on the raw notifications' own permission, not view_circuitmaintenance as in Nautobot

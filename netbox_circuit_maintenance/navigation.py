@@ -22,6 +22,11 @@ menu = PluginMenu(
                     link_text=_('Notifications'),
                     permissions=['netbox_circuit_maintenance.view_rawnotification'],
                 ),
+                PluginMenuItem(
+                    link='plugins:netbox_circuit_maintenance:notificationsource_list',
+                    link_text=_('Notification Sources'),
+                    permissions=['netbox_circuit_maintenance.view_notificationsource'],
+                ),
             ),
         ),
     ),

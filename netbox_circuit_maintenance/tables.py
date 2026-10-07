@@ -4,12 +4,13 @@ import django_tables2 as tables
 from django.utils.translation import gettext_lazy as _
 from netbox.tables import NetBoxTable, PrimaryModelTable, columns
 
-from .models import CircuitImpact, CircuitMaintenance, Note, ParsedNotification, RawNotification
+from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
 
 __all__ = (
     'CircuitImpactTable',
     'CircuitMaintenanceTable',
     'NoteTable',
+    'NotificationSourceTable',
     'ParsedNotificationTable',
     'RawNotificationTable',
 )
@@ -171,6 +172,38 @@ class NoteTable(NetBoxTable):
         default_columns = ('pk', 'maintenance', 'level', 'title', 'last_updated', 'comment')
 
 
+class NotificationSourceTable(NetBoxTable):
+    name = tables.Column(
+        verbose_name=_('Name'),
+        linkify=True,
+    )
+    attach_all_providers = columns.BooleanColumn(
+        verbose_name=_('Attach all providers'),
+    )
+    providers = columns.ManyToManyColumn(
+        verbose_name=_('Providers'),
+        linkify_item=True,
+    )
+    tags = columns.TagColumn(
+        url_name='plugins:netbox_circuit_maintenance:notificationsource_list',
+    )
+
+    class Meta(NetBoxTable.Meta):
+        model = NotificationSource
+        fields = (
+            'pk',
+            'id',
+            'name',
+            'attach_all_providers',
+            'providers',
+            'tags',
+            'created',
+            'last_updated',
+            'actions',
+        )
+        default_columns = ('pk', 'name', 'attach_all_providers', 'providers')
+
+
 class RawNotificationTable(NetBoxTable):
     subject = tables.Column(
         verbose_name=_('Subject'),
@@ -180,9 +213,9 @@ class RawNotificationTable(NetBoxTable):
         verbose_name=_('Provider'),
         linkify=True,
     )
-    # Not linked until NotificationSource has a detail view
     source = tables.Column(
         verbose_name=_('Source'),
+        linkify=True,
     )
     parsed = columns.BooleanColumn(
         verbose_name=_('Parsed'),

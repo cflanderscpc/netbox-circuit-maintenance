@@ -1,15 +1,15 @@
 from circuits.api.serializers import CircuitSerializer, ProviderSerializer
 from netbox.api.fields import ChoiceField
 from netbox.api.serializers import NetBoxModelSerializer, PrimaryModelSerializer
-from rest_framework import serializers
 
 from ..choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from ..models import CircuitImpact, CircuitMaintenance, Note, ParsedNotification, RawNotification
+from ..models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
 
 __all__ = (
     'CircuitImpactSerializer',
     'CircuitMaintenanceSerializer',
     'NoteSerializer',
+    'NotificationSourceSerializer',
     'ParsedNotificationSerializer',
     'RawNotificationSerializer',
 )
@@ -96,10 +96,32 @@ class NoteSerializer(NetBoxModelSerializer):
         brief_fields = ('id', 'url', 'display', 'maintenance', 'title', 'level')
 
 
+class NotificationSourceSerializer(NetBoxModelSerializer):
+    providers = ProviderSerializer(nested=True, many=True, read_only=True)
+
+    class Meta:
+        model = NotificationSource
+        # The OAuth token (_token) is never exposed
+        fields = (
+            'id',
+            'url',
+            'display_url',
+            'display',
+            'name',
+            'providers',
+            'attach_all_providers',
+            'tags',
+            'custom_fields',
+            'created',
+            'last_updated',
+        )
+        brief_fields = ('id', 'url', 'display', 'name')
+
+
 class RawNotificationSerializer(NetBoxModelSerializer):
     provider = ProviderSerializer(nested=True, read_only=True)
-    # The source's ID until NotificationSource has a serializer to nest
-    source = serializers.PrimaryKeyRelatedField(read_only=True)
+    # Null once the source is deleted
+    source = NotificationSourceSerializer(nested=True, read_only=True, allow_null=True)
 
     class Meta:
         model = RawNotification

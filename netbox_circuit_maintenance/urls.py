@@ -29,6 +29,14 @@ urlpatterns = [
         include(get_model_urls('netbox_circuit_maintenance', 'note')),
     ),
     path(
+        'notification-sources/',
+        include(get_model_urls('netbox_circuit_maintenance', 'notificationsource', detail=False)),
+    ),
+    path(
+        'notification-sources/<int:pk>/',
+        include(get_model_urls('netbox_circuit_maintenance', 'notificationsource')),
+    ),
+    path(
         'raw-notifications/',
         include(get_model_urls('netbox_circuit_maintenance', 'rawnotification', detail=False)),
     ),

@@ -35,6 +35,12 @@ class NotePanel(panels.ObjectAttributesPanel):
     level = attrs.ChoiceAttr('level')
 
 
+class NotificationSourcePanel(panels.ObjectAttributesPanel):
+    name = attrs.TextAttr('name')
+    providers = attrs.RelatedObjectListAttr('providers', linkify=True, label=_('Providers'))
+    attach_all_providers = attrs.BooleanAttr('attach_all_providers')
+
+
 class LastParsedNotificationAttr(attrs.RelatedObjectAttr):
     """
     A parsed raw notification's most recently updated parsed notification, the one Nautobot's page linked.
@@ -61,8 +67,7 @@ class RawNotificationPanel(panels.ObjectAttributesPanel):
     subject = attrs.TextAttr('subject')
     provider = attrs.RelatedObjectAttr('provider', linkify=True)
     sender = attrs.TextAttr('sender')
-    # Not linked until NotificationSource has a detail view
-    source = attrs.RelatedObjectAttr('source')
+    source = attrs.RelatedObjectAttr('source', linkify=True)
     parsed = attrs.BooleanAttr('parsed')
     parsed_notification = LastParsedNotificationAttr(
         'parsed_notifications', linkify=True, label=_('Parsed notification')

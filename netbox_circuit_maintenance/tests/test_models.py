@@ -530,8 +530,7 @@ class NotificationSourceTestCase(TestCase):
         self.assertEqual(source.serialize_object(exclude=['last_updated'])['name'], 'Source 1')
 
     def test_changelog(self):
-        # Deleting a provider removes it from the source, which NetBox records as an update to the source. The source
-        # has no REST serializer yet, but update events serialize lazily, so the delete works under event tracking.
+        # Deleting a provider removes it from the source, which NetBox records as an update to the source
         request = RequestFactory().get('/')
         request.id = uuid.uuid4()
         request.user = User.objects.create_user(username='user1')
@@ -566,6 +565,72 @@ class NotificationSourceTestCase(TestCase):
             self.assertNotIn('_token', change.postchange_data)
         source.refresh_from_db()
         self.assertEqual(source._token, self.token)
+
+    def test_changelog_delete_with_raw_notifications(self):
+        # Under event tracking NetBox nulls each raw notification's source with save(), recording an update and moving
+        # its last_updated (which is why the handler's fetch window will read created; Decisions 2026-10-07). It also
+        # serializes the deleted source for events straight away, so the delete needs the REST serializer
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = User.objects.create_user(username='user1')
+        source = NotificationSource.objects.create(name='Source 1', _token=self.token)
+        raw_notifications = [
+            RawNotification.objects.create(
+                subject=f'Subject {i}', provider=self.providers[0], source=source, raw=b'body', stamp=START
+            )
+            for i in range(2)
+        ]
+        source_pk = source.pk
+
+        with event_tracking(request):
+            source.delete()
+
+        change = ObjectChange.objects.get(
+            changed_object_type=ObjectType.objects.get_for_model(NotificationSource), changed_object_id=source_pk
+        )
+        self.assertEqual(
+            (change.action, change.prechange_data['name']), (ObjectChangeActionChoices.ACTION_DELETE, 'Source 1')
+        )
+        self.assertNotIn('_token', change.prechange_data)
+        changes = ObjectChange.objects.filter(
+            changed_object_type=ObjectType.objects.get_for_model(RawNotification)
+        ).order_by('changed_object_id')
+        self.assertEqual(
+            [
+                (
+                    change.changed_object_id,
+                    change.action,
+                    change.prechange_data['source'],
+                    change.postchange_data['source'],
+                )
+                for change in changes
+            ],
+            [
+                (raw_notification.pk, ObjectChangeActionChoices.ACTION_UPDATE, source_pk, None)
+                for raw_notification in raw_notifications
+            ],
+        )
+        for raw_notification in raw_notifications:
+            last_updated = raw_notification.last_updated
+            raw_notification.refresh_from_db()
+            self.assertIsNone(raw_notification.source)
+            self.assertGreater(raw_notification.last_updated, last_updated)
+
+    def test_event_data(self):
+        # Event rule and webhook data comes from the REST serializer, which leaves out the token
+        source = NotificationSource.objects.create(name='Source 1', _token=self.token)
+        source.providers.set(self.providers)
+
+        data = serialize_for_event(source)
+        self.assertNotIn('_token', data)
+        self.assertEqual(
+            [provider['id'] for provider in data['providers']], [provider.pk for provider in self.providers]
+        )
+
+    def test_get_absolute_url(self):
+        source = NotificationSource.objects.create(name='Source 1')
+
+        self.assertEqual(source.get_absolute_url(), f'/plugins/circuit-maintenance/notification-sources/{source.pk}/')
 
     def test_export_template_token_attribute(self):
         # The Jinja2 sandbox blocks underscore attributes. ORM methods such as values_list('_token') still reach the

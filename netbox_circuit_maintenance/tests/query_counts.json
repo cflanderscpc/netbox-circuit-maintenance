@@ -5,6 +5,8 @@
   "circuitmaintenance:list_objects_with_permission": 23,
   "note:api_list_objects": 13,
   "note:list_objects_with_permission": 18,
+  "notificationsource:api_list_objects": 13,
+  "notificationsource:list_objects_with_permission": 18,
   "parsednotification:api_list_objects": 14,
   "parsednotification:list_objects_with_permission": 18,
   "rawnotification:api_list_objects": 14,

@@ -1,7 +1,7 @@
 from netbox.api.viewsets import NetBoxModelViewSet, NetBoxReadOnlyModelViewSet
 
 from .. import filtersets
-from ..models import CircuitImpact, CircuitMaintenance, Note, ParsedNotification, RawNotification
+from ..models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
 from . import serializers
 
 
@@ -21,6 +21,13 @@ class NoteViewSet(NetBoxModelViewSet):
     queryset = Note.objects.all()
     serializer_class = serializers.NoteSerializer
     filterset_class = filtersets.NoteFilterSet
+
+
+# Read-only: sources come from the plugin configuration
+class NotificationSourceViewSet(NetBoxReadOnlyModelViewSet):
+    queryset = NotificationSource.objects.all()
+    serializer_class = serializers.NotificationSourceSerializer
+    filterset_class = filtersets.NotificationSourceFilterSet
 
 
 class RawNotificationViewSet(NetBoxReadOnlyModelViewSet):

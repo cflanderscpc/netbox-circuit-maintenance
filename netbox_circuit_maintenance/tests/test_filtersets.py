@@ -9,6 +9,7 @@ from netbox_circuit_maintenance.filtersets import (
     CircuitImpactFilterSet,
     CircuitMaintenanceFilterSet,
     NoteFilterSet,
+    NotificationSourceFilterSet,
     ParsedNotificationFilterSet,
     RawNotificationFilterSet,
 )
@@ -240,6 +241,49 @@ class NoteTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'comment': ['foobar1', 'foobar2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
         self.assertEqual(self.filterset({'comment__ic': ['bar3']}, self.queryset).qs.count(), 1)
+
+
+@override_settings(TIME_ZONE='UTC')
+class NotificationSourceTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = NotificationSource.objects.all()
+    filterset = NotificationSourceFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.providers = (
+            Provider.objects.create(name='Provider 1', slug='provider-1'),
+            Provider.objects.create(name='Provider 2', slug='provider-2'),
+        )
+
+        sources = (
+            NotificationSource(name='Source 1'),
+            NotificationSource(name='Source 2', attach_all_providers=True),
+            NotificationSource(name='Other 3'),
+        )
+        NotificationSource.objects.bulk_create(sources)
+        sources[0].providers.set(cls.providers[:1])
+        sources[1].providers.set(cls.providers)
+
+    def test_q(self):
+        self.assertEqual(self.filterset({'q': 'source'}, self.queryset).qs.count(), 2)
+
+    def test_name(self):
+        params = {'name': ['Source 1', 'Other 3']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        self.assertEqual(self.filterset({'name__ic': ['source']}, self.queryset).qs.count(), 2)
+
+    def test_attach_all_providers(self):
+        self.assertEqual(self.filterset({'attach_all_providers': 'true'}, self.queryset).qs.count(), 1)
+        self.assertEqual(self.filterset({'attach_all_providers': 'false'}, self.queryset).qs.count(), 2)
+
+    def test_provider(self):
+        params = {'provider_id': [self.providers[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'provider': [self.providers[0].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        # Each source once, however many of its providers match
+        params = {'provider_id': [self.providers[0].pk, self.providers[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
 @override_settings(TIME_ZONE='UTC')
