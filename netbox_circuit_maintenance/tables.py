@@ -1,13 +1,16 @@
+import json
+
 import django_tables2 as tables
 from django.utils.translation import gettext_lazy as _
 from netbox.tables import NetBoxTable, PrimaryModelTable, columns
 
-from .models import CircuitImpact, CircuitMaintenance, Note, RawNotification
+from .models import CircuitImpact, CircuitMaintenance, Note, ParsedNotification, RawNotification
 
 __all__ = (
     'CircuitImpactTable',
     'CircuitMaintenanceTable',
     'NoteTable',
+    'ParsedNotificationTable',
     'RawNotificationTable',
 )
 
@@ -209,3 +212,58 @@ class RawNotificationTable(NetBoxTable):
             'actions',
         )
         default_columns = ('pk', 'subject', 'provider', 'sender', 'source', 'parsed', 'stamp')
+
+
+class ParsedNotificationTable(NetBoxTable):
+    maintenance = tables.Column(
+        verbose_name=_('Maintenance'),
+        linkify=True,
+    )
+    # The raw notification's subject
+    raw_notification = tables.Column(
+        verbose_name=_('Raw notification'),
+        linkify=True,
+    )
+    provider = tables.Column(
+        accessor='raw_notification__provider',
+        verbose_name=_('Provider'),
+        linkify=True,
+    )
+    stamp = columns.DateTimeColumn(
+        accessor='raw_notification__stamp',
+        verbose_name=_('Stamp'),
+    )
+    json = columns.TemplateColumn(
+        template_code='<pre class="mb-0">{{ value|json }}</pre>',
+        verbose_name=_('JSON'),
+        orderable=False,
+    )
+    tags = columns.TagColumn(
+        url_name='plugins:netbox_circuit_maintenance:parsednotification_list',
+    )
+    # Parsed notifications can't be edited or deleted
+    actions = columns.ActionsColumn(
+        actions=('changelog',),
+    )
+
+    class Meta(NetBoxTable.Meta):
+        model = ParsedNotification
+        fields = (
+            'pk',
+            'id',
+            'maintenance',
+            'raw_notification',
+            'provider',
+            'stamp',
+            'json',
+            'tags',
+            'created',
+            'last_updated',
+            'actions',
+        )
+        # id links to the parsed notification itself
+        default_columns = ('pk', 'id', 'maintenance', 'raw_notification', 'provider', 'stamp')
+
+    def value_json(self, value):
+        # Exported as JSON, not the rendered (escaped) template
+        return json.dumps(value)

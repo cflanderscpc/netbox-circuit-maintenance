@@ -35,15 +35,25 @@ class NotePanel(panels.ObjectAttributesPanel):
     level = attrs.ChoiceAttr('level')
 
 
-class ParsedMaintenanceAttr(attrs.RelatedObjectAttr):
+class LastParsedNotificationAttr(attrs.RelatedObjectAttr):
     """
-    The maintenance of a parsed raw notification's most recently updated parsed notification.
+    A parsed raw notification's most recently updated parsed notification, the one Nautobot's page linked.
     """
 
     def get_value(self, obj):
         if not obj.parsed:
             return None
-        parsed_notification = obj.parsed_notifications.select_related('maintenance').last()
+        # The related manager sets raw_notification to obj; a select_related() copy would load the body again
+        return obj.parsed_notifications.select_related('maintenance').last()
+
+
+class ParsedMaintenanceAttr(LastParsedNotificationAttr):
+    """
+    The maintenance of a parsed raw notification's most recently updated parsed notification.
+    """
+
+    def get_value(self, obj):
+        parsed_notification = super().get_value(obj)
         return parsed_notification.maintenance if parsed_notification else None
 
 
@@ -54,6 +64,9 @@ class RawNotificationPanel(panels.ObjectAttributesPanel):
     # Not linked until NotificationSource has a detail view
     source = attrs.RelatedObjectAttr('source')
     parsed = attrs.BooleanAttr('parsed')
+    parsed_notification = LastParsedNotificationAttr(
+        'parsed_notifications', linkify=True, label=_('Parsed notification')
+    )
     maintenance = ParsedMaintenanceAttr('parsed_notifications', linkify=True, label=_('Maintenance'))
     stamp = attrs.DateTimeAttr('stamp')
 
@@ -68,3 +81,8 @@ class RawContentPanel(panels.TextCodePanel):
         ctx = super().get_context(context)
         # bytes() also accepts a memoryview
         return {**ctx, 'value': bytes(ctx['value'] or b'').decode('utf-8', errors='replace')}
+
+
+class ParsedNotificationPanel(panels.ObjectAttributesPanel):
+    maintenance = attrs.RelatedObjectAttr('maintenance', linkify=True)
+    raw_notification = attrs.RelatedObjectAttr('raw_notification', linkify=True)

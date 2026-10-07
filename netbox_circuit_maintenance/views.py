@@ -2,12 +2,12 @@ from django.utils.translation import gettext_lazy as _
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
 from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport, DeleteObject
 from netbox.ui import actions, layout
-from netbox.ui.panels import CommentsPanel, ObjectsTablePanel
+from netbox.ui.panels import CommentsPanel, JSONPanel, ObjectsTablePanel
 from netbox.views import generic
 from utilities.views import register_model_view
 
 from . import filtersets, forms, tables
-from .models import CircuitImpact, CircuitMaintenance, Note, RawNotification
+from .models import CircuitImpact, CircuitMaintenance, Note, ParsedNotification, RawNotification
 from .ui import panels
 
 #
@@ -72,6 +72,14 @@ class CircuitMaintenanceView(generic.ObjectView):
                         url_params={'maintenance': lambda ctx: ctx['object'].pk},
                     ),
                 ],
+            ),
+            # Newest notification first, from the list view's queryset. Only the notification handler adds them
+            ObjectsTablePanel(
+                model='netbox_circuit_maintenance.ParsedNotification',
+                title=_('Notifications'),
+                filters={'maintenance_id': lambda ctx: ctx['object'].pk},
+                include_columns=['raw_notification', 'stamp', 'json'],
+                exclude_columns=['maintenance', 'provider'],
             ),
         ],
     )
@@ -280,3 +288,40 @@ class RawNotificationBulkDeleteView(generic.BulkDeleteView):
     queryset = RawNotification.objects.all()
     filterset = filtersets.RawNotificationFilterSet
     table = tables.RawNotificationTable
+
+
+#
+# ParsedNotification
+#
+
+
+# Not in the menu: reached through the detail page's breadcrumb, and loaded by the maintenance's Notifications panel
+@register_model_view(ParsedNotification, 'list', path='', detail=False)
+class ParsedNotificationListView(generic.ObjectListView):
+    # Newest notification first, as on Nautobot's maintenance page; pk keeps pagination stable when stamps tie. The
+    # table doesn't show the raw notification's body (up to 16 KB per row)
+    queryset = (
+        ParsedNotification.objects.select_related('raw_notification')
+        .defer('raw_notification__raw')
+        .order_by('-raw_notification__stamp', '-pk')
+    )
+    filterset = filtersets.ParsedNotificationFilterSet
+    table = tables.ParsedNotificationTable
+    actions = (BulkExport,)
+
+
+# Template parsednotification.html adds the raw notification to the breadcrumbs
+@register_model_view(ParsedNotification)
+class ParsedNotificationView(generic.ObjectView):
+    queryset = ParsedNotification.objects.all()
+    actions = ()
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.ParsedNotificationPanel(),
+            CustomFieldsPanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            JSONPanel('json', title=_('JSON')),
+        ],
+    )

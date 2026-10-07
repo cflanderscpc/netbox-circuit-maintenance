@@ -7,12 +7,13 @@ from utilities.filters import MultiValueCharFilter
 from utilities.filtersets import register_filterset
 
 from .choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, RawNotification
+from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
 
 __all__ = (
     'CircuitImpactFilterSet',
     'CircuitMaintenanceFilterSet',
     'NoteFilterSet',
+    'ParsedNotificationFilterSet',
     'RawNotificationFilterSet',
 )
 
@@ -177,3 +178,35 @@ class RawNotificationFilterSet(NetBoxModelFilterSet):
         if not value.strip():
             return queryset
         return queryset.filter(subject__icontains=value)
+
+
+@register_filterset
+class ParsedNotificationFilterSet(NetBoxModelFilterSet):
+    maintenance_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=CircuitMaintenance.objects.all(),
+        distinct=False,
+        label=_('Maintenance (ID)'),
+    )
+    maintenance = django_filters.ModelMultipleChoiceFilter(
+        field_name='maintenance__name',
+        queryset=CircuitMaintenance.objects.all(),
+        distinct=False,
+        to_field_name='name',
+        label=_('Maintenance (name)'),
+    )
+    raw_notification_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=RawNotification.objects.all(),
+        distinct=False,
+        label=_('Raw notification (ID)'),
+    )
+
+    class Meta:
+        model = ParsedNotification
+        # json can't be filtered with django-filter
+        fields = ('id',)
+
+    def search(self, queryset, name, value):
+        # Nautobot ran icontains on the raw_notification foreign key itself (Decisions 2026-09-29)
+        if not value.strip():
+            return queryset
+        return queryset.filter(raw_notification__subject__icontains=value)

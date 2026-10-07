@@ -36,4 +36,12 @@ urlpatterns = [
         'raw-notifications/<int:pk>/',
         include(get_model_urls('netbox_circuit_maintenance', 'rawnotification')),
     ),
+    path(
+        'parsed-notifications/',
+        include(get_model_urls('netbox_circuit_maintenance', 'parsednotification', detail=False)),
+    ),
+    path(
+        'parsed-notifications/<int:pk>/',
+        include(get_model_urls('netbox_circuit_maintenance', 'parsednotification')),
+    ),
 ]

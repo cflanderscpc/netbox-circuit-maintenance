@@ -4,13 +4,15 @@ from datetime import UTC, datetime, timedelta
 
 from circuits.models import Circuit, CircuitType, Provider
 from core.choices import ObjectChangeActionChoices
+from core.events import OBJECT_DELETED
 from core.models import ObjectChange, ObjectType
 from django.conf import settings
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms import modelform_factory
 from django.test import RequestFactory, TestCase
+from extras.choices import EventRuleActionChoices
 from extras.events import serialize_for_event
-from extras.models import ExportTemplate
+from extras.models import EventRule, ExportTemplate, Notification, NotificationGroup
 from google.oauth2.credentials import Credentials
 from netbox.context_managers import event_tracking
 from users.models import User
@@ -886,8 +888,9 @@ class ParsedNotificationTestCase(TestCase):
         self.assertFalse(ParsedNotification.objects.exists())
 
     def test_changelog_related_object(self):
-        # Same as CircuitImpactTestCase.test_changelog_related_object, without the delete until this model has a REST
-        # serializer
+        # Same as CircuitImpactTestCase.test_changelog_related_object, with the delete cascaded from the raw
+        # notification. Under event tracking NetBox serializes a deleted object for events straight away, so the delete
+        # needs the REST serializer
         request = RequestFactory().get('/')
         request.id = uuid.uuid4()
         request.user = User.objects.create_user(username='user1')
@@ -900,10 +903,13 @@ class ParsedNotificationTestCase(TestCase):
             parsed_notification.snapshot()
             parsed_notification.json = {'maintenance_id': 'UT-TEST', 'status': 'CONFIRMED'}
             parsed_notification.save()
+        parsed_notification_pk = parsed_notification.pk
+        with event_tracking(request):
+            self.raw_notifications[0].delete()
 
         changes = ObjectChange.objects.filter(
             changed_object_type=ObjectType.objects.get_for_model(ParsedNotification),
-            changed_object_id=parsed_notification.pk,
+            changed_object_id=parsed_notification_pk,
         ).order_by('pk')
         self.assertEqual(
             [
@@ -923,10 +929,66 @@ class ParsedNotificationTestCase(TestCase):
                     maintenance.pk,
                     'Parsed notification for Subject 1',
                 ),
+                (
+                    ObjectChangeActionChoices.ACTION_DELETE,
+                    'circuitmaintenance',
+                    maintenance.pk,
+                    'Parsed notification for Subject 1',
+                ),
             ],
         )
         # The parser output stays in the change record
         self.assertEqual(changes[1].postchange_data['json'], {'maintenance_id': 'UT-TEST', 'status': 'CONFIRMED'})
+
+    def test_delete_event_notification_long_subject(self):
+        # An event rule notification stores the REST display in a varchar(200) and doesn't truncate it once the object
+        # is gone, so a delete with a 200-character subject relies on __str__ staying within 200 characters
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = User.objects.create_user(username='user1')
+        RawNotification.objects.filter(pk=self.raw_notifications[0].pk).update(
+            subject='x' * MAX_NOTIFICATION_SUBJECT_LENGTH
+        )
+        parsed_notification = self.parsed_notification()
+        parsed_notification.raw_notification.refresh_from_db()
+        parsed_notification.save()
+        notification_group = NotificationGroup.objects.create(name='Group 1')
+        notification_group.users.add(request.user)
+        event_rule = EventRule.objects.create(
+            name='Rule 1',
+            event_types=[OBJECT_DELETED],
+            action_type=EventRuleActionChoices.NOTIFICATION,
+            action_object=notification_group,
+        )
+        event_rule.object_types.add(ObjectType.objects.get_for_model(ParsedNotification))
+
+        with event_tracking(request):
+            parsed_notification.snapshot()
+            parsed_notification.delete()
+
+        notification = Notification.objects.get(user=request.user)
+        self.assertEqual(notification.event_type, OBJECT_DELETED)
+        self.assertEqual(notification.object_repr, f'Parsed notification for {"x" * 176}')
+
+    def test_event_data(self):
+        # Event rule and webhook data comes from the REST serializer: the parser output as an object, and the raw
+        # notification without its body
+        parsed_notification = self.parsed_notification()
+        parsed_notification.save()
+
+        data = serialize_for_event(parsed_notification)
+        self.assertEqual(data['json'], {'maintenance_id': 'UT-TEST'})
+        self.assertEqual(data['raw_notification']['subject'], 'Subject 1')
+        self.assertNotIn('raw', data['raw_notification'])
+
+    def test_get_absolute_url(self):
+        parsed_notification = self.parsed_notification()
+        parsed_notification.save()
+
+        self.assertEqual(
+            parsed_notification.get_absolute_url(),
+            f'/plugins/circuit-maintenance/parsed-notifications/{parsed_notification.pk}/',
+        )
 
     def test_docs_url(self):
         self.assertIsNone(ParsedNotification().docs_url)

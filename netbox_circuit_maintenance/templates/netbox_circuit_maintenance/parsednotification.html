@@ -1,0 +1,8 @@
+{% extends 'generic/object.html' %}
+
+{% block breadcrumbs %}
+  {{ block.super }}
+  <li class="breadcrumb-item">
+    <a href="{{ object.raw_notification.get_absolute_url }}">{{ object.raw_notification }}</a>
+  </li>
+{% endblock %}

@@ -9,6 +9,7 @@ from netbox_circuit_maintenance.filtersets import (
     CircuitImpactFilterSet,
     CircuitMaintenanceFilterSet,
     NoteFilterSet,
+    ParsedNotificationFilterSet,
     RawNotificationFilterSet,
 )
 from netbox_circuit_maintenance.models import (
@@ -16,6 +17,7 @@ from netbox_circuit_maintenance.models import (
     CircuitMaintenance,
     Note,
     NotificationSource,
+    ParsedNotification,
     RawNotification,
 )
 
@@ -321,3 +323,55 @@ class RawNotificationTestCase(TestCase, ChangeLoggedFilterSetTests):
     def test_since(self):
         # Nautobot's name for stamp__gte
         self.assertEqual(self.filterset({'since': '2020-10-04T11:00:00Z'}, self.queryset).qs.count(), 2)
+
+
+@override_settings(TIME_ZONE='UTC')
+class ParsedNotificationTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = ParsedNotification.objects.all()
+    filterset = ParsedNotificationFilterSet
+    # The parser output isn't filterable
+    ignore_fields = ('json',)
+
+    @classmethod
+    def setUpTestData(cls):
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(name='UT-TEST-2', start_time=START, end_time=END),
+        )
+        cls.raw_notifications = (
+            RawNotification.objects.create(raw=b'', subject='Subject 1', provider=provider, stamp=START),
+            RawNotification.objects.create(
+                raw=b'', subject='Other 2', provider=provider, stamp=START + timedelta(hours=1)
+            ),
+        )
+
+        ParsedNotification.objects.bulk_create(
+            (
+                ParsedNotification(
+                    maintenance=cls.maintenances[0], raw_notification=cls.raw_notifications[0], json={'id': 1}
+                ),
+                # A raw notification announcing two maintenances
+                ParsedNotification(
+                    maintenance=cls.maintenances[0], raw_notification=cls.raw_notifications[1], json={'id': 1}
+                ),
+                ParsedNotification(
+                    maintenance=cls.maintenances[1], raw_notification=cls.raw_notifications[1], json={'id': 2}
+                ),
+            )
+        )
+
+    def test_q(self):
+        # Searches the raw notification's subject (Nautobot's q ran icontains on the foreign key)
+        self.assertEqual(self.filterset({'q': 'subject'}, self.queryset).qs.count(), 1)
+        self.assertEqual(self.filterset({'q': 'other'}, self.queryset).qs.count(), 2)
+
+    def test_maintenance(self):
+        params = {'maintenance_id': [self.maintenances[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'maintenance': [self.maintenances[0].name]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_raw_notification(self):
+        params = {'raw_notification_id': [self.raw_notifications[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)

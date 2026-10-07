@@ -4,12 +4,13 @@ from netbox.api.serializers import NetBoxModelSerializer, PrimaryModelSerializer
 from rest_framework import serializers
 
 from ..choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
-from ..models import CircuitImpact, CircuitMaintenance, Note, RawNotification
+from ..models import CircuitImpact, CircuitMaintenance, Note, ParsedNotification, RawNotification
 
 __all__ = (
     'CircuitImpactSerializer',
     'CircuitMaintenanceSerializer',
     'NoteSerializer',
+    'ParsedNotificationSerializer',
     'RawNotificationSerializer',
 )
 
@@ -121,3 +122,27 @@ class RawNotificationSerializer(NetBoxModelSerializer):
             'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'provider', 'subject', 'stamp')
+
+
+class ParsedNotificationSerializer(NetBoxModelSerializer):
+    maintenance = CircuitMaintenanceSerializer(nested=True, read_only=True)
+    # Nested with RawNotificationSerializer's brief fields, which leave out the body
+    raw_notification = RawNotificationSerializer(nested=True, read_only=True)
+
+    class Meta:
+        model = ParsedNotification
+        # json is the parser output as an object; Nautobot returned it as a string (Decisions 2026-10-06)
+        fields = (
+            'id',
+            'url',
+            'display_url',
+            'display',
+            'maintenance',
+            'raw_notification',
+            'json',
+            'tags',
+            'custom_fields',
+            'created',
+            'last_updated',
+        )
+        brief_fields = ('id', 'url', 'display', 'maintenance', 'raw_notification')

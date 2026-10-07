@@ -11,6 +11,7 @@ from netbox_circuit_maintenance.models import (
     CircuitMaintenance,
     Note,
     NotificationSource,
+    ParsedNotification,
     RawNotification,
 )
 
@@ -366,3 +367,90 @@ class RawNotificationTest(
         )
         self.assertHttpStatus(response, status.HTTP_200_OK)
         self.assertEqual([item['subject'] for item in response.data['results']], ['Subject 3'])
+
+
+class ParsedNotificationTest(
+    APIViewTestCases.GetObjectViewTestCase,
+    APIViewTestCases.ListObjectsViewTestCase,
+):
+    model = ParsedNotification
+    view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    brief_fields = ['display', 'id', 'maintenance', 'raw_notification', 'url']
+
+    @classmethod
+    def setUpTestData(cls):
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(name='UT-TEST-2', start_time=START, end_time=END),
+        )
+        cls.raw_notifications = (
+            RawNotification.objects.create(raw=b'body 1', subject='Subject 1', provider=provider, stamp=START),
+            RawNotification.objects.create(
+                raw=b'body 2', subject='Subject 2', provider=provider, stamp=START + timedelta(hours=1)
+            ),
+        )
+
+        ParsedNotification.objects.bulk_create(
+            (
+                ParsedNotification(
+                    maintenance=cls.maintenances[0],
+                    raw_notification=cls.raw_notifications[0],
+                    json={'maintenance_id': 'UT-TEST-1', 'status': 'TENTATIVE'},
+                ),
+                ParsedNotification(
+                    maintenance=cls.maintenances[0],
+                    raw_notification=cls.raw_notifications[1],
+                    json={'maintenance_id': 'UT-TEST-1', 'status': 'CONFIRMED'},
+                ),
+                ParsedNotification(
+                    maintenance=cls.maintenances[1],
+                    raw_notification=cls.raw_notifications[1],
+                    json={'maintenance_id': 'UT-TEST-2', 'status': 'CONFIRMED'},
+                ),
+            )
+        )
+
+    def test_get_object_json_and_raw_notification(self):
+        # json is an object, where Nautobot returned a string; the nested raw notification leaves out the body
+        parsed_notification = ParsedNotification.objects.get(raw_notification=self.raw_notifications[0])
+        self.add_permissions('netbox_circuit_maintenance.view_parsednotification')
+
+        response = self.client.get(self._get_detail_url(parsed_notification), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['json'], {'maintenance_id': 'UT-TEST-1', 'status': 'TENTATIVE'})
+        self.assertEqual(response.data['maintenance']['id'], self.maintenances[0].pk)
+        self.assertEqual(response.data['raw_notification']['subject'], 'Subject 1')
+        self.assertNotIn('raw', response.data['raw_notification'])
+
+    def test_read_only(self):
+        # Only the notification handler creates parsed notifications, and nobody edits them
+        parsed_notification = ParsedNotification.objects.first()
+        self.add_permissions(
+            'netbox_circuit_maintenance.add_parsednotification',
+            'netbox_circuit_maintenance.change_parsednotification',
+            'netbox_circuit_maintenance.delete_parsednotification',
+        )
+
+        response = self.client.post(self._get_list_url(), {}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+        response = self.client.patch(
+            self._get_detail_url(parsed_notification), {'json': {}}, format='json', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+        response = self.client.delete(self._get_detail_url(parsed_notification), **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_list_objects_filtered(self):
+        self.add_permissions('netbox_circuit_maintenance.view_parsednotification')
+
+        response = self.client.get(
+            self._get_list_url(),
+            {'maintenance': 'UT-TEST-1', 'raw_notification_id': self.raw_notifications[1].pk},
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(
+            [item['json'] for item in response.data['results']],
+            [{'maintenance_id': 'UT-TEST-1', 'status': 'CONFIRMED'}],
+        )

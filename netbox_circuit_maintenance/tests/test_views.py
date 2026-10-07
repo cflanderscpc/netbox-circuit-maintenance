@@ -1,11 +1,16 @@
+import csv
+import io
+import json
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from circuits.models import Circuit, CircuitTermination, CircuitType, Provider
 from core.models import ObjectType
 from dcim.models import Site
-from django.test import override_settings
+from django.test import RequestFactory, override_settings
 from django.urls import reverse
 from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
+from netbox.context_managers import event_tracking
 from users.models import ObjectPermission
 from utilities.testing import ViewTestCases, create_tags, post_data
 
@@ -34,9 +39,7 @@ class CircuitMaintenanceTestCase(PluginViewTestMixin, ViewTestCases.PrimaryObjec
 
     @classmethod
     def setUpTestData(cls):
-        # No parsed notifications: a maintenance delete cascades to them, and under event tracking each deleted object
-        # needs a REST serializer, which that model doesn't have yet. Impacts and notes are covered by
-        # test_delete_object_with_impacts_and_notes.
+        # Deleting a maintenance with impacts, notes and parsed notifications is covered by test_delete_object_with_children
         maintenances = (
             CircuitMaintenance(name='UT-TEST-1', start_time=START, end_time=END),
             CircuitMaintenance(
@@ -219,25 +222,59 @@ class CircuitMaintenanceTestCase(PluginViewTestMixin, ViewTestCases.PrimaryObjec
         self.assertNotContains(response, reverse('plugins:netbox_circuit_maintenance:note_list'))
         self.assertNotContains(response, reverse('plugins:netbox_circuit_maintenance:note_add'))
 
+    def test_get_object_notifications_panel(self):
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_circuitmaintenance',
+            'netbox_circuit_maintenance.view_parsednotification',
+        )
+
+        response = self.client.get(maintenance.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Notifications')
+        # The table loads over HTMX from the parsed notification list, filtered to this maintenance
+        list_url = reverse('plugins:netbox_circuit_maintenance:parsednotification_list')
+        self.assertContains(response, f'{list_url}?embedded=True&maintenance_id={maintenance.pk}')
+
+    def test_get_object_notifications_panel_hidden_without_permission(self):
+        # The panel gates on ParsedNotification's own permission, not the maintenance's
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        response = self.client.get(maintenance.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, reverse('plugins:netbox_circuit_maintenance:parsednotification_list'))
+
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
-    def test_delete_object_with_impacts_and_notes(self):
+    def test_delete_object_with_children(self):
         maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
         provider = Provider.objects.create(name='Provider 1', slug='provider-1')
         circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
         circuit = Circuit.objects.create(cid='CID-1', provider=provider, type=circuit_type)
         impact = CircuitImpact.objects.create(maintenance=maintenance, circuit=circuit)
         note = Note.objects.create(maintenance=maintenance, title='Note 1', comment='comment 1')
+        raw_notification = RawNotification.objects.create(
+            raw=b'body', subject='Subject 1', provider=provider, stamp=START
+        )
+        parsed_notification = ParsedNotification.objects.create(
+            maintenance=maintenance, raw_notification=raw_notification, json={'maintenance_id': 'UT-TEST-1'}
+        )
         self.add_permissions('netbox_circuit_maintenance.delete_circuitmaintenance')
 
-        # The confirmation lists the impact and the note with links, and the delete serializes them for events
+        # The confirmation lists the impact, the note and the parsed notification with links, and the delete
+        # serializes them for events
         response = self.client.get(self._get_url('delete', maintenance))
         self.assertHttpStatus(response, 200)
         self.assertContains(response, impact.get_absolute_url())
         self.assertContains(response, note.get_absolute_url())
+        self.assertContains(response, parsed_notification.get_absolute_url())
         response = self.client.post(self._get_url('delete', maintenance), post_data({'confirm': True}))
         self.assertHttpStatus(response, 302)
         self.assertFalse(CircuitImpact.objects.filter(pk=impact.pk).exists())
         self.assertFalse(Note.objects.filter(pk=note.pk).exists())
+        self.assertFalse(ParsedNotification.objects.filter(pk=parsed_notification.pk).exists())
+        # The raw notification stays
+        self.assertTrue(RawNotification.objects.filter(pk=raw_notification.pk).exists())
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_get_object_changelog_with_impact(self):
@@ -275,6 +312,29 @@ class CircuitMaintenanceTestCase(PluginViewTestMixin, ViewTestCases.PrimaryObjec
         response = self.client.get(self._get_url('changelog', maintenance))
         self.assertHttpStatus(response, 200)
         self.assertContains(response, f'<a href="{note.get_absolute_url()}">{note}</a>', html=True)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_get_object_changelog_with_parsed_notification(self):
+        # A parsed notification the handler stores under event tracking is listed in the maintenance's changelog,
+        # linked to the parsed notification
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-1')
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        raw_notification = RawNotification.objects.create(
+            raw=b'body', subject='Subject 1', provider=provider, stamp=START
+        )
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = self.user
+        with event_tracking(request):
+            parsed_notification = ParsedNotification.objects.create(
+                maintenance=maintenance, raw_notification=raw_notification, json={'maintenance_id': 'UT-TEST-1'}
+            )
+
+        response = self.client.get(self._get_url('changelog', maintenance))
+        self.assertHttpStatus(response, 200)
+        self.assertContains(
+            response, f'<a href="{parsed_notification.get_absolute_url()}">{parsed_notification}</a>', html=True
+        )
 
 
 class CircuitImpactTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObjectViewTestCase):
@@ -611,8 +671,7 @@ class RawNotificationTestCase(
 
     @classmethod
     def setUpTestData(cls):
-        # No parsed notifications: a delete cascades to them, and under event tracking each deleted object needs a REST
-        # serializer, which that model doesn't have yet
+        # Deletes cascading to parsed notifications are covered by the *_with_parsed_notifications tests
         cls.providers = (
             Provider(name='Provider 3', slug='provider-3'),
             Provider(name='Provider 4', slug='provider-4'),
@@ -686,28 +745,34 @@ class RawNotificationTestCase(
         self.assertContains(response, '&lt;b&gt;Maintenance&lt;/b&gt; caf\N{REPLACEMENT CHARACTER}')
         self.assertNotContains(response, '<b>Maintenance</b>')
 
-    def test_get_object_parsed_maintenance(self):
-        # A parsed notification links to the maintenance of its most recently updated parsed notification
+    def test_get_object_parsed_notification(self):
+        # A parsed notification links to its most recently updated parsed notification and that one's maintenance
         raw_notification = RawNotification.objects.get(subject='Subject 1')
         maintenances = (
             CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
             CircuitMaintenance.objects.create(name='UT-TEST-2', start_time=START, end_time=END),
         )
-        for maintenance in maintenances:
+        parsed_notifications = [
             ParsedNotification.objects.create(
                 maintenance=maintenance, raw_notification=raw_notification, json={'maintenance_id': maintenance.name}
             )
+            for maintenance in maintenances
+        ]
         self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
 
         response = self.client.get(raw_notification.get_absolute_url())
         self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, parsed_notifications[1].get_absolute_url())
         self.assertNotContains(response, maintenances[1].get_absolute_url())
 
         raw_notification.parsed = True
         raw_notification.save()
         response = self.client.get(raw_notification.get_absolute_url())
         self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Parsed notification')
+        self.assertContains(response, parsed_notifications[1].get_absolute_url())
         self.assertContains(response, maintenances[1].get_absolute_url())
+        self.assertNotContains(response, parsed_notifications[0].get_absolute_url())
         self.assertNotContains(response, maintenances[0].get_absolute_url())
 
     def test_list_objects_filtered(self):
@@ -739,22 +804,211 @@ class RawNotificationTestCase(
         self.assertHttpStatus(response, 200)
         self.assertContains(response, f'{self._get_url("list")}?provider_id={self.providers[1].pk}')
 
+    def parse(self, subject):
+        maintenance = CircuitMaintenance.objects.create(
+            name=f'Maintenance for {subject}', start_time=START, end_time=END
+        )
+        raw_notification = RawNotification.objects.get(subject=subject)
+        return ParsedNotification.objects.create(
+            maintenance=maintenance, raw_notification=raw_notification, json={'maintenance_id': maintenance.name}
+        )
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_delete_object_with_parsed_notifications(self):
+        parsed_notification = self.parse('Subject 1')
+        raw_notification = parsed_notification.raw_notification
+        self.add_permissions('netbox_circuit_maintenance.delete_rawnotification')
+
+        # The confirmation lists the parsed notification with a link, and the delete serializes it for events
+        response = self.client.get(self._get_url('delete', raw_notification))
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, parsed_notification.get_absolute_url())
+        response = self.client.post(self._get_url('delete', raw_notification), post_data({'confirm': True}))
+        self.assertHttpStatus(response, 302)
+        self.assertFalse(ParsedNotification.objects.exists())
+        # The maintenance stays
+        self.assertTrue(CircuitMaintenance.objects.filter(pk=parsed_notification.maintenance.pk).exists())
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_bulk_delete_objects_with_parsed_notifications(self):
+        self.parse('Subject 1')
+        self.parse('Subject 2')
+        self.add_permissions('netbox_circuit_maintenance.delete_rawnotification')
+
+        response = self.client.post(
+            self._get_url('bulk_delete'),
+            {'pk': list(RawNotification.objects.values_list('pk', flat=True)), 'confirm': True, '_confirm': True},
+        )
+        self.assertHttpStatus(response, 302)
+        self.assertFalse(RawNotification.objects.exists())
+        self.assertFalse(ParsedNotification.objects.exists())
+
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_delete_provider_with_raw_notifications(self):
-        # Deleting a core provider cascades to its raw notifications, which under event tracking need the REST serializer
+        # Deleting a core provider cascades to its raw notifications and their parsed notifications, which under event
+        # tracking need their REST serializers
         provider = self.providers[1]
         raw_notification = RawNotification.objects.get(subject='Subject 2')
+        parsed_notification = self.parse('Subject 2')
         obj_perm = ObjectPermission(name='Test permission', actions=['delete'])
         obj_perm.save()
         obj_perm.users.add(self.user)
         obj_perm.object_types.add(ObjectType.objects.get_for_model(Provider))
 
-        # The confirmation lists the raw notifications with links
+        # The confirmation lists the raw and parsed notifications with links
         response = self.client.get(reverse('circuits:provider_delete', kwargs={'pk': provider.pk}))
         self.assertHttpStatus(response, 200)
         self.assertContains(response, raw_notification.get_absolute_url())
+        self.assertContains(response, parsed_notification.get_absolute_url())
         response = self.client.post(
             reverse('circuits:provider_delete', kwargs={'pk': provider.pk}), post_data({'confirm': True})
         )
         self.assertHttpStatus(response, 302)
         self.assertEqual(list(RawNotification.objects.values_list('subject', flat=True)), ['Subject 1'])
+        self.assertFalse(ParsedNotification.objects.exists())
+
+
+class ParsedNotificationTestCase(
+    PluginViewTestMixin,
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.GetObjectChangelogViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+):
+    model = ParsedNotification
+
+    @classmethod
+    def setUpTestData(cls):
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        cls.maintenances = (
+            CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance.objects.create(name='UT-TEST-2', start_time=START, end_time=END),
+        )
+        # Stamps in the opposite order of creation, so the list order can't come from last_updated or pk
+        cls.raw_notifications = tuple(
+            RawNotification.objects.create(
+                raw=f'body {i}'.encode(), subject=f'Subject {i}', provider=provider, stamp=START - timedelta(hours=i)
+            )
+            for i in range(1, 4)
+        )
+
+        ParsedNotification.objects.bulk_create(
+            (
+                ParsedNotification(
+                    maintenance=cls.maintenances[0],
+                    raw_notification=cls.raw_notifications[0],
+                    json={'maintenance_id': 'UT-TEST-1', 'status': 'CONFIRMED'},
+                ),
+                ParsedNotification(
+                    maintenance=cls.maintenances[0],
+                    raw_notification=cls.raw_notifications[1],
+                    json={'maintenance_id': 'UT-TEST-1', 'status': 'TENTATIVE'},
+                ),
+                ParsedNotification(
+                    maintenance=cls.maintenances[1],
+                    raw_notification=cls.raw_notifications[2],
+                    json={'maintenance_id': 'UT-TEST-2', 'status': 'TENTATIVE'},
+                ),
+            )
+        )
+
+    def test_get_object_attributes(self):
+        parsed_notification = ParsedNotification.objects.get(raw_notification=self.raw_notifications[0])
+        parsed_notification.json = {'maintenance_id': 'UT-TEST-1', 'summary': '<b>Planned</b> work'}
+        parsed_notification.save()
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_parsednotification',
+            'netbox_circuit_maintenance.add_parsednotification',
+            'netbox_circuit_maintenance.change_parsednotification',
+            'netbox_circuit_maintenance.delete_parsednotification',
+        )
+
+        response = self.client.get(parsed_notification.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, self.maintenances[0].get_absolute_url())
+        # Breadcrumbs: Parsed Notifications, then the raw notification, as Nautobot's page led back to it
+        self.assertContains(
+            response,
+            f'<li class="breadcrumb-item"><a href="{self.raw_notifications[0].get_absolute_url()}">Subject 1</a></li>',
+            html=True,
+        )
+        self.assertContains(response, f'href="{self._get_url("list")}"')
+        # The parser output, formatted and escaped
+        self.assertContains(response, '&quot;summary&quot;: &quot;&lt;b&gt;Planned&lt;/b&gt; work&quot;')
+        self.assertNotContains(response, '<b>Planned</b>')
+        # Parsed notifications can't be cloned, edited or deleted, whatever the user's permissions
+        self.assertNotContains(response, f'{parsed_notification.get_absolute_url()}edit/')
+        self.assertNotContains(response, f'{parsed_notification.get_absolute_url()}delete/')
+        self.assertNotContains(response, f'{self._get_url("list")}add/')
+
+    def test_list_objects_ordering(self):
+        # Newest raw notification first, as on Nautobot's maintenance page, although the model orders by last update
+        self.add_permissions('netbox_circuit_maintenance.view_parsednotification')
+
+        response = self.client.get(self._get_url('list'))
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(
+            [parsed_notification.raw_notification.subject for parsed_notification in response.context['table'].data],
+            ['Subject 1', 'Subject 2', 'Subject 3'],
+        )
+
+    def test_list_objects_panel_columns(self):
+        # What the maintenance's Notifications panel asks for: Nautobot's columns in its order, plus the ID linking the
+        # parsed notification
+        self.add_permissions('netbox_circuit_maintenance.view_parsednotification')
+
+        response = self.client.get(
+            self._get_url('list'),
+            {
+                'maintenance_id': self.maintenances[0].pk,
+                'include_columns': 'raw_notification,stamp,json',
+                'exclude_columns': 'maintenance,provider',
+            },
+        )
+        self.assertHttpStatus(response, 200)
+        table = response.context['table']
+        self.assertEqual(
+            [parsed_notification.raw_notification.subject for parsed_notification in table.data],
+            ['Subject 1', 'Subject 2'],
+        )
+        self.assertEqual(
+            [column.name for column in table.columns if column.visible],
+            ['id', 'raw_notification', 'stamp', 'json', 'actions'],
+        )
+        self.assertContains(response, self.raw_notifications[0].get_absolute_url())
+        self.assertContains(response, '&quot;status&quot;: &quot;CONFIRMED&quot;')
+        self.assertNotContains(response, self.maintenances[0].get_absolute_url())
+
+    def test_export_json(self):
+        # The JSON column exports the parser output as JSON
+        self.add_permissions('netbox_circuit_maintenance.view_parsednotification')
+
+        response = self.client.get(
+            self._get_url('list'),
+            {'export': 'table', 'maintenance_id': self.maintenances[1].pk, 'include_columns': 'json'},
+        )
+        self.assertHttpStatus(response, 200)
+        rows = list(csv.DictReader(io.StringIO(response.content.decode())))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0]['JSON']), {'maintenance_id': 'UT-TEST-2', 'status': 'TENTATIVE'})
+
+    def test_list_objects_actions(self):
+        # Export only: parsed notifications can't be added, imported, edited or deleted
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_parsednotification',
+            'netbox_circuit_maintenance.add_parsednotification',
+            'netbox_circuit_maintenance.change_parsednotification',
+            'netbox_circuit_maintenance.delete_parsednotification',
+        )
+
+        response = self.client.get(self._get_url('list'))
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Export')
+        for action in ('add', 'import', 'edit', 'delete'):
+            self.assertNotContains(response, f'{self._get_url("list")}{action}/')
+
+    def test_menu(self):
+        # The list isn't in the menu
+        self.add_permissions('netbox_circuit_maintenance.view_parsednotification')
+
+        response = self.client.get(reverse('home'))
+        self.assertNotContains(response, f'href="{self._get_url("list")}"')

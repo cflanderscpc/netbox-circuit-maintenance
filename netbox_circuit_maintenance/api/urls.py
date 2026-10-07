@@ -7,5 +7,6 @@ router.register('circuit-maintenances', views.CircuitMaintenanceViewSet)
 router.register('circuit-impacts', views.CircuitImpactViewSet)
 router.register('notes', views.NoteViewSet)
 router.register('raw-notifications', views.RawNotificationViewSet)
+router.register('parsed-notifications', views.ParsedNotificationViewSet)
 
 urlpatterns = router.urls
