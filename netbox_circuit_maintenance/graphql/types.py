@@ -42,8 +42,12 @@ class CircuitMaintenanceType(PrimaryObjectType):
     ]
 
 
+# GraphQL names start with CircuitMaintenance, so they can't clash with another plugin's NoteType: a duplicate name stops
+# NetBox's URLconf, which builds the schema, from loading. The Python names stay <Model>Type, where NetBox's test helpers
+# look for them
 @strawberry_django.type(
     models.CircuitImpact,
+    name='CircuitMaintenanceCircuitImpactType',
     fields='__all__',
     filters=CircuitImpactFilter,
     pagination=True,
@@ -55,6 +59,7 @@ class CircuitImpactType(NetBoxObjectType):
 
 @strawberry_django.type(
     models.Note,
+    name='CircuitMaintenanceNoteType',
     fields='__all__',
     filters=NoteFilter,
     pagination=True,
@@ -65,6 +70,7 @@ class NoteType(NetBoxObjectType):
 
 @strawberry_django.type(
     models.NotificationSource,
+    name='CircuitMaintenanceNotificationSourceType',
     # The OAuth token stays out of GraphQL, as out of REST and the change log
     exclude=['_token'],
     filters=NotificationSourceFilter,
@@ -79,6 +85,7 @@ class NotificationSourceType(NetBoxObjectType):
 
 @strawberry_django.type(
     models.RawNotification,
+    name='CircuitMaintenanceRawNotificationType',
     # strawberry_django can't map a BinaryField
     exclude=['raw'],
     filters=RawNotificationFilter,
@@ -94,6 +101,7 @@ class RawNotificationType(NetBoxObjectType):
 
 @strawberry_django.type(
     models.ParsedNotification,
+    name='CircuitMaintenanceParsedNotificationType',
     fields='__all__',
     filters=ParsedNotificationFilter,
     pagination=True,

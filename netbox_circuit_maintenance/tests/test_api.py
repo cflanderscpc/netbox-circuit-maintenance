@@ -4,10 +4,13 @@ from circuits.models import Circuit, CircuitType, Provider
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from graphql import GraphQLInputObjectType, GraphQLInterfaceType, GraphQLObjectType, GraphQLUnionType, get_named_type
+from netbox.graphql.schema import schema
 from rest_framework import status
-from utilities.testing import APITestCase, APIViewTestCases, GraphQLFilterTest, GraphQLQueryTest
+from utilities.testing import APITestCase, APIViewTestCases, GraphQLFilterTest, GraphQLQueryTest, TestCase
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.graphql.schema import CircuitMaintenanceQuery
 from netbox_circuit_maintenance.graphql.types import NotificationSourceType, RawNotificationType
 from netbox_circuit_maintenance.models import (
     CircuitImpact,
@@ -712,3 +715,38 @@ class GraphQLSchemaCoverageTest(APIViewTestCases.GraphQLSchemaCoverageTestCase):
             for type_class, model in super().get_schema_type_classes().items()
             if model._meta.app_label == 'netbox_circuit_maintenance'
         }
+
+
+class GraphQLSchemaNamesTest(TestCase):
+    def test_names_prefixed(self):
+        # GraphQL type names are global across NetBox and every plugin, and a duplicate stops NetBox from building its
+        # schema. Every name the plugin adds, generated filter inputs included, starts with CircuitMaintenance; the
+        # root query fields keep their short names (Decisions 2026-10-13)
+        def named_types(fields):
+            names = set()
+            pending = [get_named_type(field.type) for field in fields]
+            pending += [get_named_type(arg.type) for field in fields for arg in field.args.values()]
+            while pending:
+                graphql_type = pending.pop()
+                if graphql_type.name in names:
+                    continue
+                names.add(graphql_type.name)
+                if isinstance(graphql_type, (GraphQLObjectType, GraphQLInterfaceType)):
+                    for field in graphql_type.fields.values():
+                        pending.append(get_named_type(field.type))
+                        pending += [get_named_type(arg.type) for arg in field.args.values()]
+                elif isinstance(graphql_type, GraphQLInputObjectType):
+                    pending += [get_named_type(field.type) for field in graphql_type.fields.values()]
+                elif isinstance(graphql_type, GraphQLUnionType):
+                    pending += graphql_type.types
+            return names
+
+        root_fields = schema._schema.query_type.fields
+        plugin_field_names = {field.name for field in CircuitMaintenanceQuery.__strawberry_definition__.fields}
+        plugin_names = named_types([field for name, field in root_fields.items() if name in plugin_field_names])
+        core_names = named_types([field for name, field in root_fields.items() if name not in plugin_field_names])
+        added_names = plugin_names - core_names
+
+        self.assertIn('CircuitMaintenanceNoteType', added_names)
+        self.assertIn('CircuitMaintenanceNoteLevelEnumBaseFilterLookup', added_names)
+        self.assertEqual(sorted(name for name in added_names if not name.startswith('CircuitMaintenance')), [])

@@ -42,7 +42,8 @@ class CircuitMaintenanceFilter(PrimaryModelFilter):
     )
 
 
-@strawberry_django.filter_type(models.CircuitImpact, lookups=True)
+# GraphQL names start with CircuitMaintenance, as in types.py
+@strawberry_django.filter_type(models.CircuitImpact, lookups=True, name='CircuitMaintenanceCircuitImpactFilter')
 class CircuitImpactFilter(NetBoxModelFilter):
     maintenance: (
         Annotated['CircuitMaintenanceFilter', strawberry.lazy('netbox_circuit_maintenance.graphql.filters')] | None
@@ -58,7 +59,7 @@ class CircuitImpactFilter(NetBoxModelFilter):
     ) = strawberry_django.filter_field()
 
 
-@strawberry_django.filter_type(models.Note, lookups=True)
+@strawberry_django.filter_type(models.Note, lookups=True, name='CircuitMaintenanceNoteFilter')
 class NoteFilter(NetBoxModelFilter):
     maintenance: (
         Annotated['CircuitMaintenanceFilter', strawberry.lazy('netbox_circuit_maintenance.graphql.filters')] | None
@@ -71,7 +72,9 @@ class NoteFilter(NetBoxModelFilter):
     comment: StrFilterLookup | None = strawberry_django.filter_field()
 
 
-@strawberry_django.filter_type(models.NotificationSource, lookups=True)
+@strawberry_django.filter_type(
+    models.NotificationSource, lookups=True, name='CircuitMaintenanceNotificationSourceFilter'
+)
 class NotificationSourceFilter(NetBoxModelFilter):
     name: StrFilterLookup | None = strawberry_django.filter_field()
     providers: Annotated['ProviderFilter', strawberry.lazy('circuits.graphql.filters')] | None = (
@@ -80,7 +83,7 @@ class NotificationSourceFilter(NetBoxModelFilter):
     attach_all_providers: FilterLookup[bool] | None = strawberry_django.filter_field()
 
 
-@strawberry_django.filter_type(models.RawNotification, lookups=True)
+@strawberry_django.filter_type(models.RawNotification, lookups=True, name='CircuitMaintenanceRawNotificationFilter')
 class RawNotificationFilter(NetBoxModelFilter):
     # No filter on raw, which the GraphQL type leaves out
     subject: StrFilterLookup | None = strawberry_django.filter_field()
@@ -97,7 +100,9 @@ class RawNotificationFilter(NetBoxModelFilter):
     stamp: DatetimeFilterLookup | None = strawberry_django.filter_field()
 
 
-@strawberry_django.filter_type(models.ParsedNotification, lookups=True)
+@strawberry_django.filter_type(
+    models.ParsedNotification, lookups=True, name='CircuitMaintenanceParsedNotificationFilter'
+)
 class ParsedNotificationFilter(NetBoxModelFilter):
     maintenance: (
         Annotated['CircuitMaintenanceFilter', strawberry.lazy('netbox_circuit_maintenance.graphql.filters')] | None
