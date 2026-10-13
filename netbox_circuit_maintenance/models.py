@@ -132,7 +132,7 @@ class CircuitImpact(NetBoxModel):
         constraints = (
             models.UniqueConstraint(
                 fields=('maintenance', 'circuit'),
-                name='%(app_label)s_%(class)s_unique_maintenance_circuit',
+                name='%(app_label)s_%(class)s_unique_circuit',
             ),
         )
         indexes = (models.Index(fields=('maintenance', 'impact', 'id')),)  # Default ordering

@@ -1,6 +1,8 @@
 from importlib import metadata
 
+from django.apps import apps
 from django.conf import settings
+from django.db import connection
 from django.test import override_settings
 from django.urls import reverse
 from utilities.testing import APITestCase, TestCase
@@ -34,6 +36,14 @@ class PluginTest(TestCase):
         self.assertHttpStatus(response, 200)
         plugins = {plugin.config_name: plugin for plugin in response.context['table'].data}
         self.assertTrue(plugins['netbox_circuit_maintenance'].is_loaded)
+
+    def test_constraint_name_lengths(self):
+        # PostgreSQL silently truncates longer identifiers, and Django checks only index and column name lengths
+        max_length = connection.ops.max_name_length()
+        for model in apps.get_app_config('netbox_circuit_maintenance').get_models():
+            for constraint in model._meta.constraints:
+                with self.subTest(constraint=constraint.name):
+                    self.assertLessEqual(len(constraint.name), max_length)
 
 
 class PluginAPITest(APITestCase):
