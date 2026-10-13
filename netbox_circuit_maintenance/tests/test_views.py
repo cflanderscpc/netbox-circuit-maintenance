@@ -2,17 +2,31 @@ import csv
 import io
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from unittest.mock import patch
 
 from circuits.models import Circuit, CircuitTermination, CircuitType, Provider
 from core.models import ObjectType
-from dcim.models import Site
+from dcim.models import (
+    Cable,
+    Device,
+    DeviceRole,
+    DeviceType,
+    FrontPort,
+    Interface,
+    Manufacturer,
+    PortMapping,
+    RearPort,
+    Site,
+)
+from django.conf import settings
 from django.test import RequestFactory, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
 from netbox.context_managers import event_tracking
 from users.models import ObjectPermission
-from utilities.testing import ViewTestCases, create_tags, post_data
+from utilities.testing import ModelViewTestCase, ViewTestCases, create_tags, post_data
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
 from netbox_circuit_maintenance.models import (
@@ -23,6 +37,7 @@ from netbox_circuit_maintenance.models import (
     ParsedNotification,
     RawNotification,
 )
+from netbox_circuit_maintenance.views import CircuitMaintenanceOverviewView
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
@@ -1152,3 +1167,330 @@ class ParsedNotificationTestCase(
 
         response = self.client.get(reverse('home'))
         self.assertNotContains(response, f'href="{self._get_url("list")}"')
+
+
+class CircuitMaintenanceOverviewTestCase(PluginViewTestMixin, ModelViewTestCase):
+    # Ports Nautobot's DashboardTest and DashboardTestZeroMaintenances, which called the view's helpers with this date;
+    # the requests here patch timezone.localdate, which the view reads per request
+    model = CircuitMaintenance
+    today = date(2022, 8, 25)
+
+    @classmethod
+    def setUpTestData(cls):
+        maintenances = {
+            name: CircuitMaintenance.objects.create(name=name, start_time=start, end_time=start + timedelta(hours=2))
+            for name, start in (
+                ('UT-TEST-1', datetime(2022, 8, 24, 10, tzinfo=UTC)),  # In the past 7 days
+                ('UT-TEST-4', datetime(2022, 8, 16, 10, tzinfo=UTC)),  # In the past 30 days
+                ('UT-TEST-2', datetime(2022, 8, 26, 10, tzinfo=UTC)),  # In the next 7 days
+                ('UT-TEST-3', datetime(2022, 8, 27, 10, tzinfo=UTC)),  # In the next 7 days
+                ('UT-TEST-5', datetime(2022, 3, 27, 10, tzinfo=UTC)),  # In the past 365 days
+            )
+        }
+
+        cls.sites = {name: Site.objects.create(name=name, slug=name.lower()) for name in ('Site A', 'Site B', 'Site Z')}
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model='Device Type 1', slug='device-type-1')
+        role = DeviceRole.objects.create(name='Device Role 1', slug='device-role-1')
+        cls.devices = {
+            name: Device.objects.create(name=name, site=cls.sites[site], device_type=device_type, role=role)
+            for name, site in (
+                ('Device A', 'Site A'),
+                ('Patch Panel', 'Site A'),
+                ('Device B', 'Site B'),
+                ('Device Z', 'Site Z'),
+            )
+        }
+        interfaces = {
+            name: Interface.objects.create(device=cls.devices[name], name='eth0', type='1000base-t')
+            for name in ('Device A', 'Device B', 'Device Z')
+        }
+        front_port = FrontPort.objects.create(device=cls.devices['Patch Panel'], name='Front Port 1', type='8p8c')
+        rear_port = RearPort.objects.create(device=cls.devices['Patch Panel'], name='Rear Port 1', type='8p8c')
+        PortMapping.objects.create(
+            device=cls.devices['Patch Panel'],
+            front_port=front_port,
+            front_port_position=1,
+            rear_port=rear_port,
+            rear_port_position=1,
+        )
+
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
+        cls.circuits = {
+            cid: Circuit.objects.create(cid=cid, provider=provider, type=circuit_type)
+            for cid in ('CID-1', 'CID-2', 'CID-3')
+        }
+        terminations = {
+            (cid, side): CircuitTermination.objects.create(
+                circuit=cls.circuits[cid], term_side=side, termination=cls.sites[site]
+            )
+            for cid, side, site in (
+                ('CID-1', 'A', 'Site A'),
+                ('CID-1', 'Z', 'Site Z'),
+                ('CID-2', 'A', 'Site A'),
+                ('CID-2', 'Z', 'Site B'),
+            )
+        }
+        # CID-1: Device A through a patch panel on the A side, Device Z on the Z side. CID-2: Device B on the Z side
+        # only. CID-3 has no terminations
+        Cable(a_terminations=[interfaces['Device A']], b_terminations=[front_port]).save()
+        Cable(a_terminations=[rear_port], b_terminations=[terminations['CID-1', 'A']]).save()
+        Cable(a_terminations=[terminations['CID-1', 'Z']], b_terminations=[interfaces['Device Z']]).save()
+        Cable(a_terminations=[terminations['CID-2', 'Z']], b_terminations=[interfaces['Device B']]).save()
+
+        CircuitImpact.objects.bulk_create(
+            CircuitImpact(maintenance=maintenances[name], circuit=cls.circuits[cid])
+            for name, cid in (('UT-TEST-2', 'CID-1'), ('UT-TEST-3', 'CID-2'), ('UT-TEST-1', 'CID-3'))
+        )
+
+    def get_dashboard(self, today=None):
+        with patch('django.utils.timezone.localdate', return_value=today or self.today):
+            response = self.client.get(self._get_url('overview'))
+        self.assertHttpStatus(response, 200)
+        return response
+
+    def get_metrics(self, today=None):
+        return {str(label): value for label, value in self.get_dashboard(today).context['metrics']}
+
+    def plugin_settings(self, **overrides):
+        # override_settings replaces the whole setting, so keep the defaults NetBox merged in at startup
+        plugin_config = {**settings.PLUGINS_CONFIG['netbox_circuit_maintenance'], **overrides}
+        return self.settings(PLUGINS_CONFIG={**settings.PLUGINS_CONFIG, 'netbox_circuit_maintenance': plugin_config})
+
+    def test_get_maintenances_next_n_days(self):
+        view = CircuitMaintenanceOverviewView()
+
+        maintenances = view.get_maintenances_next_n_days(self.today, 7)
+        self.assertEqual([maintenance.name for maintenance in maintenances], ['UT-TEST-2', 'UT-TEST-3'])
+
+    def test_metrics(self):
+        # Nautobot's past-days, historical-matrix, future-maintenances and per-month tests
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance', 'circuits.view_circuit')
+
+        self.assertEqual(
+            self.get_metrics(),
+            {
+                'Upcoming Maintenances': 2,
+                'Historical - 7 Days': 1,
+                'Historical - 30 Days': 2,
+                'Historical - 365 Days': 3,
+                'Average Duration of Maintenances': '120.0 minutes',
+                'Future Maintenances': 2,
+                'Average Number of Maintenances Per Month': 0.8,  # 5 from March to August
+                'Future Maintenance to Circuit Ratio': 0.67,  # 2 upcoming, 3 circuits
+            },
+        )
+
+    def test_metrics_zero_maintenances(self):
+        CircuitMaintenance.objects.all().delete()
+        Circuit.objects.all().delete()
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance', 'circuits.view_circuit')
+
+        self.assertEqual(
+            self.get_metrics(),
+            {
+                'Upcoming Maintenances': 0,
+                'Historical - 7 Days': 0,
+                'Historical - 30 Days': 0,
+                'Historical - 365 Days': 0,
+                'Average Duration of Maintenances': 'No maintenances found.',
+                'Future Maintenances': 0,
+                'Average Number of Maintenances Per Month': 0,
+                'Future Maintenance to Circuit Ratio': 0,
+            },
+        )
+
+    def test_metrics_average_duration(self):
+        # The exact average; Nautobot rounded each duration to whole minutes first, giving 60.0
+        CircuitMaintenance.objects.all().delete()
+        for name, duration in (('UT-TEST-1', timedelta(minutes=90, seconds=30)), ('UT-TEST-2', timedelta(minutes=30))):
+            CircuitMaintenance.objects.create(name=name, start_time=START, end_time=START + duration)
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        self.assertEqual(self.get_metrics()['Average Duration of Maintenances'], '60.25 minutes')
+
+    def test_metrics_per_month_one_maintenance(self):
+        # Nautobot returned 0 for fewer than two maintenances
+        CircuitMaintenance.objects.exclude(name='UT-TEST-1').delete()
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        self.assertEqual(self.get_metrics()['Average Number of Maintenances Per Month'], 1.0)
+
+    def test_metrics_restricted(self):
+        # Counts cover only the maintenances and circuits the user can view
+        obj_perm = ObjectPermission(
+            name='Test permission', actions=['view'], constraints={'name__in': ['UT-TEST-2', 'UT-TEST-5']}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(CircuitMaintenance))
+        obj_perm = ObjectPermission(name='Test permission 2', actions=['view'], constraints={'cid': 'CID-1'})
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Circuit))
+
+        metrics = self.get_metrics()
+        self.assertEqual(metrics['Upcoming Maintenances'], 1)
+        self.assertEqual(metrics['Historical - 365 Days'], 1)
+        self.assertEqual(metrics['Future Maintenances'], 1)
+        self.assertEqual(metrics['Average Number of Maintenances Per Month'], 0.3)  # 2 from March to August
+        self.assertEqual(metrics['Future Maintenance to Circuit Ratio'], 1.0)  # 1 upcoming, 1 circuit
+
+    def test_date_per_request(self):
+        # Nautobot evaluated today once, at import
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        self.assertEqual(self.get_metrics()['Future Maintenances'], 2)
+        self.assertEqual(self.get_metrics(date(2022, 8, 28))['Future Maintenances'], 0)
+
+    def test_dashboard_n_days(self):
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        with self.plugin_settings(dashboard_n_days=2):
+            response = self.get_dashboard()
+            metrics = self.get_metrics()
+        self.assertContains(response, 'Circuits With Maintenances in the Next 2 Days')
+        self.assertContains(response, 'Devices With Maintenances in the Next 2 Days')
+        self.assertEqual(metrics['Upcoming Maintenances'], 1)
+
+    def test_affected_circuits_and_devices(self):
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_circuitmaintenance',
+            'netbox_circuit_maintenance.view_circuitimpact',
+            'circuits.view_circuit',
+            'dcim.view_device',
+        )
+
+        response = self.get_dashboard()
+        # A side first; CID-2 has a device on the Z side only, which Nautobot's Location column left out
+        self.assertEqual(
+            [
+                (row['maintenance'].name, row['circuit'].cid, [site.name for site in row['sites']])
+                for row in response.context['circuit_rows']
+            ],
+            [('UT-TEST-2', 'CID-1', ['Site A', 'Site Z']), ('UT-TEST-3', 'CID-2', ['Site B'])],
+        )
+        # Device A is behind the patch panel, which isn't listed
+        self.assertEqual(
+            [(row['maintenance'].name, row['device'].name) for row in response.context['device_rows']],
+            [('UT-TEST-2', 'Device A'), ('UT-TEST-2', 'Device Z'), ('UT-TEST-3', 'Device B')],
+        )
+        for obj in (self.circuits['CID-1'], self.sites['Site A'], self.devices['Device A']):
+            self.assertContains(response, obj.get_absolute_url())
+        self.assertNotContains(response, self.circuits['CID-3'].get_absolute_url())
+        self.assertNotContains(response, self.devices['Patch Panel'].get_absolute_url())
+
+    def test_window_boundaries(self):
+        # Both ends of each window are included: a maintenance starting at local midnight today is upcoming and in the
+        # past 7 days, and one starting at local midnight 30 days later is upcoming too
+        CircuitMaintenance.objects.all().delete()
+        midnight = timezone.make_aware(datetime.combine(self.today, time()))
+        for name, start in (('UT-TEST-1', midnight), ('UT-TEST-2', midnight + timedelta(days=30))):
+            CircuitMaintenance.objects.create(name=name, start_time=start, end_time=start + timedelta(hours=2))
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        metrics = self.get_metrics()
+        self.assertEqual(metrics['Upcoming Maintenances'], 2)
+        self.assertEqual(metrics['Historical - 7 Days'], 1)
+        self.assertEqual(metrics['Future Maintenances'], 2)
+
+    def test_dashboard_n_days_negative(self):
+        # Nothing upcoming, as in Nautobot
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        with self.plugin_settings(dashboard_n_days=-5):
+            metrics = self.get_metrics()
+        self.assertEqual(metrics['Upcoming Maintenances'], 0)
+        self.assertEqual(metrics['Historical - 7 Days'], 1)
+
+    def test_affected_devices_circuits_in_series(self):
+        # Device S1 -- CID-S1 -- CID-S2 -- Device S2: each termination's device is the one reached over its own cable,
+        # beyond the other circuit where there is one
+        provider = Provider.objects.get(slug='provider-1')
+        circuit_type = CircuitType.objects.get(slug='circuit-type-1')
+        maintenance = CircuitMaintenance.objects.get(name='UT-TEST-2')
+        device_type = DeviceType.objects.get(slug='device-type-1')
+        role = DeviceRole.objects.get(slug='device-role-1')
+        interfaces = []
+        for name, site in (('Device S1', 'Site A'), ('Device S2', 'Site Z')):
+            device = Device.objects.create(name=name, site=self.sites[site], device_type=device_type, role=role)
+            interfaces.append(Interface.objects.create(device=device, name='eth0', type='1000base-t'))
+        terminations = []
+        for cid in ('CID-S1', 'CID-S2'):
+            circuit = Circuit.objects.create(cid=cid, provider=provider, type=circuit_type)
+            CircuitImpact.objects.create(maintenance=maintenance, circuit=circuit)
+            for side in ('A', 'Z'):
+                terminations.append(
+                    CircuitTermination.objects.create(circuit=circuit, term_side=side, termination=self.sites['Site A'])
+                )
+        Cable(a_terminations=[interfaces[0]], b_terminations=[terminations[0]]).save()
+        Cable(a_terminations=[terminations[1]], b_terminations=[terminations[2]]).save()
+        Cable(a_terminations=[terminations[3]], b_terminations=[interfaces[1]]).save()
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_circuitmaintenance',
+            'netbox_circuit_maintenance.view_circuitimpact',
+            'circuits.view_circuit',
+            'dcim.view_device',
+        )
+
+        response = self.get_dashboard()
+        self.assertEqual(
+            [
+                (row['circuit'].cid, [site.name for site in row['sites']])
+                for row in response.context['circuit_rows']
+                if row['circuit'].cid.startswith('CID-S')
+            ],
+            [('CID-S1', ['Site A', 'Site Z']), ('CID-S2', ['Site A', 'Site Z'])],
+        )
+        self.assertEqual(
+            [
+                row['device'].name
+                for row in response.context['device_rows']
+                if row['device'].name.startswith('Device S')
+            ],
+            ['Device S1', 'Device S2', 'Device S1', 'Device S2'],
+        )
+
+    def test_affected_circuits_and_devices_restricted(self):
+        # Circuits need the impacts' and the circuits' view permissions, devices their own
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance', 'circuits.view_circuit')
+        response = self.get_dashboard()
+        self.assertEqual(response.context['circuit_rows'], [])
+        self.assertEqual(response.context['device_rows'], [])
+
+        self.add_permissions('netbox_circuit_maintenance.view_circuitimpact')
+        self.remove_permissions('circuits.view_circuit')
+        response = self.get_dashboard()
+        self.assertEqual(response.context['circuit_rows'], [])
+
+        self.add_permissions('circuits.view_circuit')
+        response = self.get_dashboard()
+        self.assertEqual([row['circuit'].cid for row in response.context['circuit_rows']], ['CID-1', 'CID-2'])
+        self.assertEqual([row['sites'] for row in response.context['circuit_rows']], [[], []])
+        self.assertEqual(response.context['device_rows'], [])
+
+        obj_perm = ObjectPermission(name='Test permission', actions=['view'], constraints={'name': 'Device Z'})
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Device))
+        response = self.get_dashboard()
+        self.assertEqual(
+            [[site.name for site in row['sites']] for row in response.context['circuit_rows']], [['Site Z'], []]
+        )
+        self.assertEqual([row['device'].name for row in response.context['device_rows']], ['Device Z'])
+
+    def test_permission_required(self):
+        response = self.client.get(self._get_url('overview'))
+        self.assertHttpStatus(response, 403)
+
+    def test_menu_item(self):
+        overview_url = self._get_url('overview')
+        response = self.client.get(reverse('home'))
+        self.assertNotContains(response, f'href="{overview_url}"')
+
+        # First in the menu group, before the maintenance list
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+        content = self.client.get(reverse('home')).content.decode()
+        self.assertIn(f'href="{overview_url}"', content)
+        self.assertLess(content.index(f'href="{overview_url}"'), content.index(f'href="{self._get_url("list")}"'))

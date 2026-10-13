@@ -1,0 +1,87 @@
+{% extends 'base/layout.html' %}
+{% load i18n %}
+
+{% block title %}{% trans "Circuit Maintenance Dashboard" %}{% endblock %}
+
+{% block header %}
+  {{ block.super }}
+  <div class="page-header m-0">
+    <div class="container-fluid mt-2 d-print-none">
+      <h1 class="page-title">{% trans "Circuit Maintenance Dashboard" %}</h1>
+    </div>
+  </div>
+{% endblock header %}
+
+{% block content %}
+  <div class="card">
+    <h2 class="card-header">
+      {% blocktrans trimmed %}Circuits With Maintenances in the Next {{ n_days }} Days{% endblocktrans %}
+    </h2>
+    <table class="table table-hover">
+      <thead>
+        <tr>
+          <th>{% trans "Circuit ID" %}</th>
+          <th>{% trans "Site" %}</th>
+          <th>{% trans "Circuit Status" %}</th>
+          <th>{% trans "Maintenance Start" %}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in circuit_rows %}
+          <tr>
+            <td><a href="{{ row.circuit.get_absolute_url }}">{{ row.circuit.cid }}</a></td>
+            <td>
+              {% for site in row.sites %}
+                {{ site|linkify }}{% if not forloop.last %} |{% endif %}
+              {% empty %}
+                {{ ''|placeholder }}
+              {% endfor %}
+            </td>
+            <td>{% badge row.circuit.get_status_display bg_color=row.circuit.get_status_color %}</td>
+            <td>{{ row.maintenance.start_time|isodatetime:"minutes" }}</td>
+          </tr>
+        {% empty %}
+          <tr>
+            <td colspan="4" class="text-muted">{% trans "None" %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2 class="card-header">
+      {% blocktrans trimmed %}Devices With Maintenances in the Next {{ n_days }} Days{% endblocktrans %}
+    </h2>
+    <table class="table table-hover">
+      <thead>
+        <tr>
+          <th>{% trans "Device" %}</th>
+          <th>{% trans "Maintenance Start" %}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in device_rows %}
+          <tr>
+            <td>{{ row.device|linkify }}</td>
+            <td>{{ row.maintenance.start_time|isodatetime:"minutes" }}</td>
+          </tr>
+        {% empty %}
+          <tr>
+            <td colspan="2" class="text-muted">{% trans "None" %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2 class="card-header">{% trans "Metrics" %}</h2>
+    <table class="table table-hover attr-table">
+      {% for label, value in metrics %}
+        <tr>
+          <th scope="row">{{ label }}</th>
+          <td>{{ value }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  </div>
+{% endblock content %}

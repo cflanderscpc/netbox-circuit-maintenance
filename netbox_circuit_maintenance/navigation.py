@@ -8,6 +8,11 @@ menu = PluginMenu(
             _('Maintenances'),
             (
                 PluginMenuItem(
+                    link='plugins:netbox_circuit_maintenance:circuitmaintenance_overview',
+                    link_text=_('Dashboard'),
+                    permissions=['netbox_circuit_maintenance.view_circuitmaintenance'],
+                ),
+                PluginMenuItem(
                     link='plugins:netbox_circuit_maintenance:circuitmaintenance_list',
                     link_text=_('Circuit Maintenances'),
                     permissions=['netbox_circuit_maintenance.view_circuitmaintenance'],

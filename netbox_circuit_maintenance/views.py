@@ -1,10 +1,24 @@
+import datetime
+import itertools
+from collections import defaultdict
+
+from circuits.models import Circuit
+from dcim.models import Cable, CablePath, Device, Interface
+from dcim.utils import compile_path_node, decompile_path_node, object_to_path_node
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Avg, Count, F, Max, Min, Q
+from django.shortcuts import render
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.views.generic import View
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
 from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport, DeleteObject, EditObject
+from netbox.plugins import get_plugin_config
 from netbox.ui import actions, layout
 from netbox.ui.panels import CommentsPanel, JSONPanel, ObjectsTablePanel
 from netbox.views import generic
-from utilities.views import register_model_view
+from utilities.permissions import get_permission_for_model
+from utilities.views import ObjectPermissionRequiredMixin, register_model_view
 
 from . import filtersets, forms, tables
 from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
@@ -368,3 +382,184 @@ class ParsedNotificationView(generic.ObjectView):
             JSONPanel('json', title=_('JSON')),
         ],
     )
+
+
+#
+# Dashboard
+#
+
+
+def get_midnight(day):
+    """
+    Return local midnight at the start of the given date.
+    """
+    return timezone.make_aware(datetime.datetime.combine(day, datetime.time()))
+
+
+def get_date_range(day, days):
+    """
+    Return the datetimes of local midnight on the given date and local midnight the given number of days later. The
+    dashboard includes both ends, as Nautobot's did.
+    """
+    midnight = get_midnight(day)
+    return midnight, midnight + datetime.timedelta(days=days)
+
+
+def get_connected_devices(terminations, user):
+    """
+    Map the pk of each circuit termination to the devices the user can view that are connected to it: the devices of
+    the interfaces whose cable path reaches the termination over the termination's own cable, through any patch panels.
+    Stands in for Nautobot's connected_endpoint.parent, since a NetBox CircuitTermination isn't a PathEndpoint.
+    """
+    cable_type = ContentType.objects.get_for_model(Cable)
+    interface_type = ContentType.objects.get_for_model(Interface)
+    # Path node of each cabled termination: (termination pk, path node of its cable)
+    termination_nodes = {
+        object_to_path_node(termination): (termination.pk, compile_path_node(cable_type.pk, termination.cable_id))
+        for termination in terminations
+        if termination.cable_id
+    }
+    if not termination_nodes:
+        return {}
+
+    interface_ids = defaultdict(set)
+    for cable_path in CablePath.objects.filter(_nodes__overlap=list(termination_nodes)).only('path'):
+        origins = cable_path.path[0]
+        if decompile_path_node(origins[0])[0] != interface_type.pk:
+            continue
+        for previous_step, step in itertools.pairwise(cable_path.path):
+            for node in termination_nodes.keys() & set(step):
+                termination_pk, cable_node = termination_nodes[node]
+                # A path that crosses the circuit reaches its far termination from the near one, not over a cable
+                if cable_node in previous_step:
+                    interface_ids[termination_pk].update(decompile_path_node(origin)[1] for origin in origins)
+    if not interface_ids:
+        return {}
+
+    device_ids = dict(
+        Interface.objects.filter(pk__in=set().union(*interface_ids.values())).values_list('pk', 'device_id')
+    )
+    # An unnamed device's str() reads its device type and virtual chassis
+    devices = list(
+        Device.objects.restrict(user, 'view')
+        .filter(pk__in=set(device_ids.values()))
+        .select_related('site', 'device_type__manufacturer', 'virtual_chassis')
+    )
+    connected_devices = {}
+    for termination_pk, pks in interface_ids.items():
+        termination_device_ids = {device_ids.get(pk) for pk in pks}
+        connected_devices[termination_pk] = [device for device in devices if device.pk in termination_device_ids]
+    return connected_devices
+
+
+@register_model_view(CircuitMaintenance, 'overview', detail=False)
+class CircuitMaintenanceOverviewView(ObjectPermissionRequiredMixin, View):
+    """
+    Dashboard: the circuits and devices affected by the maintenances starting in the next dashboard_n_days days, and
+    maintenance metrics. Lists and counts cover only the objects the user can view.
+    """
+
+    queryset = CircuitMaintenance.objects.all()
+
+    def get_required_permission(self):
+        return get_permission_for_model(self.queryset.model, 'view')
+
+    def get(self, request):
+        n_days = get_plugin_config('netbox_circuit_maintenance', 'dashboard_n_days')
+        # Per request: Nautobot's was a class attribute, evaluated once at import (Decisions 2026-09-29)
+        today = timezone.localdate()
+        circuit_rows, device_rows = self.get_affected_objects(self.get_maintenances_next_n_days(today, n_days))
+
+        return render(
+            request,
+            'netbox_circuit_maintenance/circuitmaintenance_overview.html',
+            {
+                'n_days': n_days,
+                'circuit_rows': circuit_rows,
+                'device_rows': device_rows,
+                'metrics': self.get_metrics(today, n_days),
+            },
+        )
+
+    def get_maintenances_next_n_days(self, today, n_days):
+        return self.queryset.filter(start_time__range=get_date_range(today, n_days))
+
+    def get_affected_objects(self, maintenances):
+        """
+        Return the rows of the Circuits and Devices cards: each circuit the maintenances impact, with the sites of its
+        connected devices, and each of those devices, A side first.
+        """
+        user = self.request.user
+        impacts = list(
+            CircuitImpact.objects.restrict(user, 'view')
+            .filter(maintenance__in=maintenances, circuit__in=Circuit.objects.restrict(user, 'view'))
+            .select_related('maintenance', 'circuit__termination_a', 'circuit__termination_z')
+            .order_by('maintenance__start_time', 'maintenance__pk', 'circuit')
+        )
+        terminations = [
+            termination
+            for impact in impacts
+            for termination in (impact.circuit.termination_a, impact.circuit.termination_z)
+            if termination
+        ]
+        connected_devices = get_connected_devices(terminations, user)
+
+        circuit_rows = []
+        device_rows = []
+        for impact in impacts:
+            circuit = impact.circuit
+            devices = [
+                device
+                for termination in (circuit.termination_a, circuit.termination_z)
+                if termination
+                for device in connected_devices.get(termination.pk, ())
+            ]
+            circuit_rows.append(
+                {
+                    'circuit': circuit,
+                    'sites': list(dict.fromkeys(device.site for device in devices)),
+                    'maintenance': impact.maintenance,
+                }
+            )
+            device_rows.extend({'device': device, 'maintenance': impact.maintenance} for device in devices)
+        return circuit_rows, device_rows
+
+    def get_metrics(self, today, n_days):
+        """
+        Return the Metrics card's rows as (label, value) pairs.
+        """
+        stats = self.queryset.aggregate(
+            upcoming=Count('pk', filter=Q(start_time__range=get_date_range(today, n_days))),
+            past_7_days=Count('pk', filter=Q(start_time__range=get_date_range(today - datetime.timedelta(7), 7))),
+            past_30_days=Count('pk', filter=Q(start_time__range=get_date_range(today - datetime.timedelta(30), 30))),
+            past_365_days=Count('pk', filter=Q(start_time__range=get_date_range(today - datetime.timedelta(365), 365))),
+            future=Count('pk', filter=Q(start_time__gte=get_midnight(today))),
+            total=Count('pk'),
+            first_start=Min('start_time'),
+            last_start=Max('start_time'),
+            average_duration=Avg(F('end_time') - F('start_time')),
+        )
+        if stats['total']:
+            minutes = round(stats['average_duration'].total_seconds() / 60, 2)
+            average_duration = _('{minutes} minutes').format(minutes=minutes)
+            # Months from the first start to the last, counting both
+            first_start = timezone.localtime(stats['first_start'])
+            last_start = timezone.localtime(stats['last_start'])
+            months = (last_start.year - first_start.year) * 12 + last_start.month - first_start.month + 1
+            per_month = round(stats['total'] / months, 1)
+        else:
+            average_duration = _('No maintenances found.')
+            per_month = 0
+        circuit_count = Circuit.objects.restrict(self.request.user, 'view').count()
+        circuit_ratio = round(stats['upcoming'] / circuit_count, 2) if circuit_count else 0
+
+        return (
+            (_('Upcoming Maintenances'), stats['upcoming']),
+            (_('Historical - 7 Days'), stats['past_7_days']),
+            (_('Historical - 30 Days'), stats['past_30_days']),
+            (_('Historical - 365 Days'), stats['past_365_days']),
+            (_('Average Duration of Maintenances'), average_duration),
+            (_('Future Maintenances'), stats['future']),
+            (_('Average Number of Maintenances Per Month'), per_month),
+            (_('Future Maintenance to Circuit Ratio'), circuit_ratio),
+        )
