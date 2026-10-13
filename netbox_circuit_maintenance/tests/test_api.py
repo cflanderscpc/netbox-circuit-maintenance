@@ -1,11 +1,14 @@
 from datetime import UTC, datetime, timedelta
 
 from circuits.models import Circuit, CircuitType, Provider
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework import status
-from utilities.testing import APITestCase, APIViewTestCases
+from utilities.testing import APITestCase, APIViewTestCases, GraphQLFilterTest, GraphQLQueryTest
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.graphql.types import NotificationSourceType, RawNotificationType
 from netbox_circuit_maintenance.models import (
     CircuitImpact,
     CircuitMaintenance,
@@ -27,14 +30,7 @@ class AppTest(APITestCase):
         self.assertEqual(response.status_code, 200)
 
 
-# GraphQLTestCase is left out until the GraphQL rows are ported (Decisions 2026-10-06)
-class CircuitMaintenanceTest(
-    APIViewTestCases.GetObjectViewTestCase,
-    APIViewTestCases.ListObjectsViewTestCase,
-    APIViewTestCases.CreateObjectViewTestCase,
-    APIViewTestCases.UpdateObjectViewTestCase,
-    APIViewTestCases.DeleteObjectViewTestCase,
-):
+class CircuitMaintenanceTest(APIViewTestCases.APIViewTestCase):
     model = CircuitMaintenance
     view_namespace = 'plugins-api:netbox_circuit_maintenance'
     brief_fields = ['description', 'display', 'end_time', 'id', 'name', 'start_time', 'url']
@@ -47,19 +43,63 @@ class CircuitMaintenanceTest(
     bulk_update_data = {
         'status': CircuitMaintenanceStatusChoices.CANCELLED,
     }
+    graphql_filter_tests = (
+        # Nautobot's filtered query
+        GraphQLFilterTest(name='name', filters='name: {exact: "UT-TEST-1"}', expected={'name': 'UT-TEST-1'}),
+        # Enum keys replace the hyphen
+        GraphQLFilterTest(
+            name='status',
+            filters='status: {exact: STATUS_IN_PROCESS}',
+            expected={'status': CircuitMaintenanceStatusChoices.IN_PROCESS},
+        ),
+        # Through the impacts, each maintenance once
+        GraphQLFilterTest(
+            name='impacts_provider_distinct',
+            filters='impacts: {circuit: {provider: {slug: {exact: "provider-1"}}}}, DISTINCT: true',
+            expected={'name__in': ('UT-TEST-1', 'UT-TEST-2')},
+        ),
+    )
+    graphql_query_tests = (
+        # Without DISTINCT, a maintenance comes once per matching impact (strawberry_django, as for core filters)
+        GraphQLQueryTest(
+            name='impacts_provider',
+            query='{ circuit_maintenance_list(filters: {impacts: {circuit: {provider: {slug: {exact: "provider-1"}}}}}) '
+            '{ name } }',
+            assert_result=lambda test, data: test.assertEqual(
+                [maintenance['name'] for maintenance in data['circuit_maintenance_list']],
+                ['UT-TEST-1', 'UT-TEST-1', 'UT-TEST-2'],
+            ),
+        ),
+    )
 
     @classmethod
     def setUpTestData(cls):
-        # No parsed notifications: deleting a maintenance cascades to them, and they have no REST serializer yet
-        CircuitMaintenance.objects.bulk_create(
+        maintenances = (
+            CircuitMaintenance(name='UT-TEST-1', start_time=START, end_time=END),
+            CircuitMaintenance(
+                name='UT-TEST-2',
+                start_time=START + timedelta(days=1),
+                end_time=END + timedelta(days=1),
+                status=CircuitMaintenanceStatusChoices.IN_PROCESS,
+            ),
+            CircuitMaintenance(
+                name='UT-TEST-3', start_time=START + timedelta(days=2), end_time=END + timedelta(days=2)
+            ),
+        )
+        CircuitMaintenance.objects.bulk_create(maintenances)
+
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
+        circuits = (
+            Circuit(cid='Circuit 1', provider=provider, type=circuit_type),
+            Circuit(cid='Circuit 2', provider=provider, type=circuit_type),
+        )
+        Circuit.objects.bulk_create(circuits)
+        CircuitImpact.objects.bulk_create(
             (
-                CircuitMaintenance(name='UT-TEST-1', start_time=START, end_time=END),
-                CircuitMaintenance(
-                    name='UT-TEST-2', start_time=START + timedelta(days=1), end_time=END + timedelta(days=1)
-                ),
-                CircuitMaintenance(
-                    name='UT-TEST-3', start_time=START + timedelta(days=2), end_time=END + timedelta(days=2)
-                ),
+                CircuitImpact(maintenance=maintenances[0], circuit=circuits[0]),
+                CircuitImpact(maintenance=maintenances[0], circuit=circuits[1]),
+                CircuitImpact(maintenance=maintenances[1], circuit=circuits[0]),
             )
         )
 
@@ -113,16 +153,11 @@ class CircuitMaintenanceTest(
         self.assertEqual(response.data, {'__all__': ['End time should be greater than start time.']})
 
 
-# GraphQLTestCase is left out until the GraphQL rows are ported (Decisions 2026-10-06)
-class CircuitImpactTest(
-    APIViewTestCases.GetObjectViewTestCase,
-    APIViewTestCases.ListObjectsViewTestCase,
-    APIViewTestCases.CreateObjectViewTestCase,
-    APIViewTestCases.UpdateObjectViewTestCase,
-    APIViewTestCases.DeleteObjectViewTestCase,
-):
+class CircuitImpactTest(APIViewTestCases.APIViewTestCase):
     model = CircuitImpact
     view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    # GraphQL returns an error for a required relation the user can't view
+    user_permissions = ('netbox_circuit_maintenance.view_circuitmaintenance', 'circuits.view_circuit')
     brief_fields = ['circuit', 'display', 'id', 'impact', 'maintenance', 'url']
     update_data = {
         'impact': CircuitImpactChoices.DEGRADED,
@@ -130,6 +165,21 @@ class CircuitImpactTest(
     bulk_update_data = {
         'impact': CircuitImpactChoices.NO_IMPACT,
     }
+    graphql_filter_tests = (
+        # Nautobot's filtered query
+        GraphQLFilterTest(
+            name='impact', filters='impact: {exact: IMPACT_OUTAGE}', expected={'impact': CircuitImpactChoices.OUTAGE}
+        ),
+        # Enum keys replace the hyphen
+        GraphQLFilterTest(
+            name='impact_hyphen',
+            filters='impact: {exact: IMPACT_REDUCED_REDUNDANCY}',
+            expected={'impact': CircuitImpactChoices.REDUCED_REDUNDANCY},
+        ),
+        GraphQLFilterTest(
+            name='circuit', filters='circuit: {cid: {exact: "Circuit 2"}}', expected={'circuit__cid': 'Circuit 2'}
+        ),
+    )
 
     @classmethod
     def setUpTestData(cls):
@@ -166,7 +216,12 @@ class CircuitImpactTest(
         CircuitImpact.objects.bulk_create(
             (
                 CircuitImpact(maintenance=cls.maintenances[0], circuit=cls.circuits[0]),
-                CircuitImpact(maintenance=cls.maintenances[0], circuit=cls.circuits[1]),
+                # Not NO_IMPACT, which test_bulk_update_objects sets: an unchanged row records no change
+                CircuitImpact(
+                    maintenance=cls.maintenances[0],
+                    circuit=cls.circuits[1],
+                    impact=CircuitImpactChoices.REDUCED_REDUNDANCY,
+                ),
                 CircuitImpact(maintenance=cls.maintenances[0], circuit=cls.circuits[2]),
             )
         )
@@ -208,16 +263,11 @@ class CircuitImpactTest(
         )
 
 
-# GraphQLTestCase is left out until the GraphQL rows are ported (Decisions 2026-10-06)
-class NoteTest(
-    APIViewTestCases.GetObjectViewTestCase,
-    APIViewTestCases.ListObjectsViewTestCase,
-    APIViewTestCases.CreateObjectViewTestCase,
-    APIViewTestCases.UpdateObjectViewTestCase,
-    APIViewTestCases.DeleteObjectViewTestCase,
-):
+class NoteTest(APIViewTestCases.APIViewTestCase):
     model = Note
     view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    # GraphQL returns an error for a required relation the user can't view
+    user_permissions = ('netbox_circuit_maintenance.view_circuitmaintenance',)
     brief_fields = ['display', 'id', 'level', 'maintenance', 'title', 'url']
     update_data = {
         'title': 'Note 7',
@@ -227,6 +277,11 @@ class NoteTest(
     bulk_update_data = {
         'level': NoteLevelChoices.WARNING,
     }
+    graphql_filter_tests = (
+        GraphQLFilterTest(
+            name='level', filters='level: {exact: LEVEL_WARNING}', expected={'level': NoteLevelChoices.WARNING}
+        ),
+    )
 
     @classmethod
     def setUpTestData(cls):
@@ -243,6 +298,10 @@ class NoteTest(
                 Note(maintenance=cls.maintenances[0], title='Note 1', comment='comment 1'),
                 Note(maintenance=cls.maintenances[0], title='Note 2', comment='comment 2'),
                 Note(maintenance=cls.maintenances[0], title='Note 3', comment='comment 3'),
+                # Last in the default order, so test_bulk_update_objects, which sets WARNING, doesn't take it
+                Note(
+                    maintenance=cls.maintenances[0], title='Note 6', level=NoteLevelChoices.WARNING, comment='comment 6'
+                ),
             )
         )
 
@@ -294,14 +353,19 @@ class NoteTest(
         self.assertEqual([note['title'] for note in response.data['results']], ['Note 2'])
 
 
-# GraphQLTestCase is left out until the GraphQL rows are ported (Decisions 2026-10-06)
 class NotificationSourceTest(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
+    APIViewTestCases.GraphQLTestCase,
 ):
     model = NotificationSource
     view_namespace = 'plugins-api:netbox_circuit_maintenance'
     brief_fields = ['display', 'id', 'name', 'url']
+    graphql_filter_tests = (
+        GraphQLFilterTest(
+            name='providers', filters='providers: {slug: {exact: "provider-2"}}', expected={'name': 'Source 2'}
+        ),
+    )
 
     @classmethod
     def setUpTestData(cls):
@@ -356,14 +420,45 @@ class NotificationSourceTest(
         self.assertHttpStatus(response, status.HTTP_200_OK)
         self.assertEqual([item['name'] for item in response.data['results']], ['Source 2'])
 
+    def test_graphql_without_token(self):
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        self.assertNotIn('_token', {field.name for field in NotificationSourceType.__strawberry_definition__.fields})
+
+        # Every field the type has
+        query = self._build_query('notification_source', id=source.pk)
+        response = self.client.post(reverse('graphql'), {'query': query}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertNotIn('errors', response.json())
+        self.assertEqual(response.json()['data']['notification_source']['name'], 'Source 1')
+        self.assertNotContains(response, 'refresh-token-value')
+
+        query = f'{{ notification_source(id: {source.pk}) {{ _token }} }}'
+        response = self.client.post(reverse('graphql'), {'query': query}, format='json', **self.header)
+        self.assertIn("Cannot query field '_token'", response.json()['errors'][0]['message'])
+
 
 class RawNotificationTest(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
+    APIViewTestCases.GraphQLTestCase,
 ):
     model = RawNotification
     view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    # GraphQL returns an error for a required relation the user can't view
+    user_permissions = ('circuits.view_provider',)
     brief_fields = ['display', 'id', 'provider', 'stamp', 'subject', 'url']
+    graphql_filter_tests = (
+        GraphQLFilterTest(
+            name='source', filters='source: {name: {exact: "Source 1"}}', expected={'subject': 'Subject 2'}
+        ),
+        # The REST filterset's since
+        GraphQLFilterTest(
+            name='stamp_gte',
+            filters=f'stamp: {{gte: "{(START + timedelta(hours=1)).isoformat()}"}}',
+            expected={'subject__in': ('Subject 2', 'Subject 3')},
+        ),
+    )
 
     @classmethod
     def setUpTestData(cls):
@@ -437,14 +532,41 @@ class RawNotificationTest(
         self.assertHttpStatus(response, status.HTTP_200_OK)
         self.assertEqual([item['subject'] for item in response.data['results']], ['Subject 3'])
 
+    def test_graphql_without_raw(self):
+        # strawberry_django can't map the BinaryField
+        self.add_permissions('netbox_circuit_maintenance.view_rawnotification')
+        self.assertNotIn('raw', {field.name for field in RawNotificationType.__strawberry_definition__.fields})
+
+        # Every field the type has
+        query = self._build_query('raw_notification_list')
+        response = self.client.post(reverse('graphql'), {'query': query}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertNotIn('errors', response.json())
+        self.assertEqual(len(response.json()['data']['raw_notification_list']), 3)
+        self.assertNotContains(response, 'body 2')
+        self.assertNotContains(response, 'Ym9keSAy')
+
 
 class ParsedNotificationTest(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
+    APIViewTestCases.GraphQLTestCase,
 ):
     model = ParsedNotification
     view_namespace = 'plugins-api:netbox_circuit_maintenance'
+    # GraphQL returns an error for a required relation the user can't view
+    user_permissions = (
+        'netbox_circuit_maintenance.view_circuitmaintenance',
+        'netbox_circuit_maintenance.view_rawnotification',
+    )
     brief_fields = ['display', 'id', 'maintenance', 'raw_notification', 'url']
+    graphql_filter_tests = (
+        GraphQLFilterTest(
+            name='json',
+            filters='json: {path: "status", lookup: {string_lookup: {exact: "CONFIRMED"}}}',
+            expected={'json__status': 'CONFIRMED'},
+        ),
+    )
 
     @classmethod
     def setUpTestData(cls):
@@ -523,3 +645,70 @@ class ParsedNotificationTest(
             [item['json'] for item in response.data['results']],
             [{'maintenance_id': 'UT-TEST-1', 'status': 'CONFIRMED'}],
         )
+
+    def test_graphql_display(self):
+        # The type builds display from an annotation rather than str(): no row loads its raw notification, body
+        # included, in queries of its own, with or without a raw_notification selection next to it, and nested lists
+        # carry the annotation too
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_circuitmaintenance',
+            'netbox_circuit_maintenance.view_parsednotification',
+        )
+        queries = {
+            '{ parsed_notification_list { id display } }': lambda data: data['parsed_notification_list'],
+            '{ parsed_notification_list { id display raw_notification { subject stamp } } }': (
+                lambda data: data['parsed_notification_list']
+            ),
+            '{ circuit_maintenance_list { parsed_notifications { id display } } }': lambda data: [
+                item for maintenance in data['circuit_maintenance_list'] for item in maintenance['parsed_notifications']
+            ],
+            '{ raw_notification_list { parsed_notifications { id display } } }': lambda data: [
+                item for raw in data['raw_notification_list'] for item in raw['parsed_notifications']
+            ],
+        }
+
+        def run(query):
+            with CaptureQueriesContext(connection) as context:
+                response = self.client.post(reverse('graphql'), {'query': query}, format='json', **self.header)
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+            self.assertNotIn('errors', response.json())
+            return queries[query](response.json()['data']), context.captured_queries
+
+        for query in queries:
+            run(query)  # Warm the caches
+        counts = {query: len(run(query)[1]) for query in queries}
+
+        # A 200-character subject, which display truncates
+        raw_notification = RawNotification.objects.create(
+            raw=b'body 3', subject='x' * 200, provider=self.raw_notifications[0].provider, stamp=START
+        )
+        ParsedNotification.objects.create(
+            maintenance=self.maintenances[1], raw_notification=raw_notification, json={'status': 'TENTATIVE'}
+        )
+
+        for query, count in counts.items():
+            with self.subTest(query=query):
+                results, captured = run(query)
+                self.assertEqual(len(captured), count)
+                self.assertEqual(
+                    sorted((int(item['id']), item['display']) for item in results),
+                    sorted((item.pk, str(item)) for item in ParsedNotification.objects.all()),
+                )
+                self.assertIn('Parsed notification for ' + 'x' * 176, {item['display'] for item in results})
+                self.assertFalse(
+                    [
+                        item['sql']
+                        for item in captured
+                        if '"netbox_circuit_maintenance_rawnotification"."raw"' in item['sql']
+                    ]
+                )
+
+
+class GraphQLSchemaCoverageTest(APIViewTestCases.GraphQLSchemaCoverageTestCase):
+    # Every root query type of the plugin has a GraphQLTestCase. NetBox's own suite covers the core types
+    def get_schema_type_classes(self):
+        return {
+            type_class: model
+            for type_class, model in super().get_schema_type_classes().items()
+            if model._meta.app_label == 'netbox_circuit_maintenance'
+        }

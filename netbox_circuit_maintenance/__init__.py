@@ -13,6 +13,8 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
     author = 'Charles Flanders'
     author_email = 'cflanders@capitalpower.com'
     base_url = 'circuit-maintenance'
+    # The default path, graphql.schema, looks for a schema attribute on the graphql package, not the list in schema.py
+    graphql_schema = 'graphql.schema.schema'
     min_version = '4.6.6'
     max_version = '4.6.99'
     default_settings = {
