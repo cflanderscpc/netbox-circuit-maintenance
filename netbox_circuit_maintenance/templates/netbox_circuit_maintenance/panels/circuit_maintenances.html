@@ -1,0 +1,31 @@
+{% extends "ui/panels/_base.html" %}
+{% load i18n %}
+
+{% block panel_content %}
+  <table class="table table-hover attr-table">
+    <thead>
+      <tr class="border-bottom">
+        <th>{% trans "Maintenance" %}</th>
+        <th>{% trans "Impact" %}</th>
+        <th>{% trans "Status" %}</th>
+        <th>{% trans "Start time" %}</th>
+        <th>{% trans "Acknowledged" %}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for impact in impacts %}
+        <tr>
+          <td>{{ impact.maintenance|linkify }}</td>
+          <td>{% badge impact.get_impact_display bg_color=impact.get_impact_color %}</td>
+          <td>{% badge impact.maintenance.get_status_display bg_color=impact.maintenance.get_status_color %}</td>
+          <td>{{ impact.maintenance.start_time|isodatetime:"minutes" }}</td>
+          <td>{% checkmark impact.maintenance.ack %}</td>
+        </tr>
+      {% empty %}
+        <tr>
+          <td colspan="5" class="text-muted">{% trans "None" %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock panel_content %}

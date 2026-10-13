@@ -1,5 +1,7 @@
 from django.utils.translation import gettext_lazy as _
-from netbox.ui import attrs, panels
+from netbox.ui import actions, attrs, panels
+
+from ..models import CircuitImpact, CircuitMaintenance
 
 
 class NotifyingProviderAttr(attrs.RelatedObjectAttr):
@@ -91,3 +93,43 @@ class RawContentPanel(panels.TextCodePanel):
 class ParsedNotificationPanel(panels.ObjectAttributesPanel):
     maintenance = attrs.RelatedObjectAttr('maintenance', linkify=True)
     raw_notification = attrs.RelatedObjectAttr('raw_notification', linkify=True)
+
+
+class CircuitMaintenancesPanel(panels.ObjectPanel):
+    """
+    The latest maintenances impacting a core circuit, newest start first, with their impact on it. Rendered on the
+    circuit's page by template_content.py; View All lists every maintenance of the circuit.
+    """
+
+    template_name = 'netbox_circuit_maintenance/panels/circuit_maintenances.html'
+    title = _('Circuit Maintenances')
+    max_items = 5
+    actions = [
+        actions.LinkAction(
+            view_name='plugins:netbox_circuit_maintenance:circuitmaintenance_list',
+            url_params={'circuit_id': lambda ctx: ctx['object'].pk},
+            label=_('View All'),
+            button_icon='arrow-right-thick',
+            permissions=['netbox_circuit_maintenance.view_circuitmaintenance'],
+        ),
+    ]
+
+    def get_context(self, context):
+        ctx = super().get_context(context)
+        user = ctx['request'].user
+        # A row shows the maintenance as well as the impact, so it needs both view permissions
+        impacts = (
+            CircuitImpact.objects.restrict(user, 'view')
+            .filter(circuit=ctx['object'], maintenance__in=CircuitMaintenance.objects.restrict(user, 'view'))
+            .select_related('maintenance')
+            .order_by('-maintenance__start_time', '-maintenance__pk')[: self.max_items]
+        )
+        return {**ctx, 'impacts': impacts}
+
+    def should_render(self, context):
+        return context['request'].user.has_perms(
+            [
+                'netbox_circuit_maintenance.view_circuitimpact',
+                'netbox_circuit_maintenance.view_circuitmaintenance',
+            ]
+        )
