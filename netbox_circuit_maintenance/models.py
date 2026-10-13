@@ -63,8 +63,8 @@ class CircuitMaintenance(PrimaryModel):
     )
 
     class Meta:
-        ordering = ['start_time']
-        indexes = (models.Index(fields=('start_time',)),)  # Default ordering
+        ordering = ['start_time', 'pk']
+        indexes = (models.Index(fields=('start_time', 'id')),)  # Default ordering
         verbose_name = _('circuit maintenance')
         verbose_name_plural = _('circuit maintenances')
 

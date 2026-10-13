@@ -128,6 +128,16 @@ class CircuitMaintenanceTestCase(TestCase):
             list(CircuitMaintenance.objects.values_list('name', flat=True)), ['UT-TEST-2', 'UT-TEST-3', 'UT-TEST-1']
         )
 
+    def test_ordering_tie(self):
+        # Equal start times fall back to pk, so REST pages don't overlap or skip rows. The update stores a new row
+        # version after the others, which is where an order by start_time alone returns it
+        maintenances = [
+            CircuitMaintenance.objects.create(name=f'UT-TEST-{i}', start_time=START, end_time=END) for i in range(3)
+        ]
+        CircuitMaintenance.objects.filter(pk=maintenances[0].pk).update(ack=True)
+
+        self.assertEqual(list(CircuitMaintenance.objects.all()), maintenances)
+
     def test_docs_url(self):
         # None hides the edit form's Help button, which would link to a missing NetBox core docs page
         self.assertIsNone(CircuitMaintenance().docs_url)
