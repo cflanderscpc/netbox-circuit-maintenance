@@ -1,7 +1,12 @@
+import logging
+
 from django.utils.translation import gettext_lazy as _
 from netbox.ui import actions, attrs, panels
 
+from ..handle_notifications.sources import Source
 from ..models import CircuitImpact, CircuitMaintenance
+
+logger = logging.getLogger(__name__)
 
 
 class NotifyingProviderAttr(attrs.RelatedObjectAttr):
@@ -41,6 +46,26 @@ class NotificationSourcePanel(panels.ObjectAttributesPanel):
     name = attrs.TextAttr('name')
     providers = attrs.RelatedObjectListAttr('providers', linkify=True, label=_('Providers'))
     attach_all_providers = attrs.BooleanAttr('attach_all_providers')
+
+
+class NotificationSourceConfigPanel(panels.ObjectPanel):
+    """
+    The mailbox that the plugin configuration sets up for a notification source: its type and account, or why it
+    can't be set up.
+    """
+
+    template_name = 'netbox_circuit_maintenance/panels/notificationsource_config.html'
+    title = _('Configuration')
+
+    def get_context(self, context):
+        ctx = super().get_context(context)
+        try:
+            source = Source.init(name=ctx['object'].name)
+        except ValueError as exc:
+            message = f'Failed to initialize source: {exc}'
+            logger.warning(message, exc_info=True, extra={'object': ctx['object']})
+            return {**ctx, 'source_type': None, 'account': None, 'error': message}
+        return {**ctx, 'source_type': type(source).__name__, 'account': source.get_account_id(), 'error': None}
 
 
 class LastParsedNotificationAttr(attrs.RelatedObjectAttr):

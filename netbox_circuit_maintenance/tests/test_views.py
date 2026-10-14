@@ -39,6 +39,8 @@ from netbox_circuit_maintenance.models import (
 )
 from netbox_circuit_maintenance.views import CircuitMaintenanceOverviewView
 
+from .utils import plugin_settings
+
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
 
@@ -674,6 +676,13 @@ class NoteTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObjectViewTe
         self.assertNotContains(response, maintenance.get_absolute_url())
 
 
+# The page's Configuration panel sets up each source from the plugin configuration
+@plugin_settings(
+    notification_sources=[
+        {'name': f'Source {i}', 'url': 'imap://mail.example.com', 'account': f'noc{i}@example.com', 'secret': f'pw-{i}'}
+        for i in (1, 2, 3)
+    ]
+)
 class NotificationSourceTestCase(
     PluginViewTestMixin,
     ViewTestCases.GetObjectViewTestCase,
@@ -732,6 +741,43 @@ class NotificationSourceTestCase(
         self.assertContains(response, self._get_url('edit', source))
         self.assertContains(response, self._get_url('delete', source))
         self.assertNotContains(response, f'{self._get_url("list")}add/')
+
+    def test_get_object_configuration(self):
+        source = NotificationSource.objects.get(name='Source 2')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        with self.assertNoLogs('netbox_circuit_maintenance'):
+            response = self.client.get(source.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Configuration')
+        self.assertContains(response, '<th scope="row">Type</th><td>IMAP</td>', html=True)
+        self.assertContains(response, '<th scope="row">Account ID</th><td>noc2@example.com</td>', html=True)
+        self.assertNotContains(response, 'Authentication status')
+        self.assertNotContains(response, 'pw-2')
+
+    def test_get_object_configuration_error(self):
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        for notification_sources, error in (
+            ([], 'Failed to initialize source: Name Source 1 not found in PLUGINS_CONFIG.'),
+            # A secret of the wrong type isn't shown
+            (
+                [{'name': 'Source 1', 'url': 'imap://mail.example.com', 'secret': 12345678}],
+                'Failed to initialize source: 2 validation errors for IMAP<br>account<br>',
+            ),
+        ):
+            with (
+                self.subTest(error=error),
+                plugin_settings(notification_sources=notification_sources),
+                self.assertLogs('netbox_circuit_maintenance.ui.panels', 'WARNING') as logs,
+            ):
+                response = self.client.get(source.get_absolute_url())
+                self.assertHttpStatus(response, 200)
+                self.assertContains(response, 'Authentication status')
+                self.assertContains(response, error)
+                self.assertNotContains(response, '12345678')
+                self.assertTrue(logs.output[0].startswith(f'WARNING:netbox_circuit_maintenance.ui.panels:{error[:40]}'))
 
     # The form only offers providers the user can view
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])

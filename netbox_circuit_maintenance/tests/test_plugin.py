@@ -19,6 +19,7 @@ class PluginTest(TestCase):
             'overlap_job_exclude_no_impact': False,
             'job_interval': None,
             'job_user': None,
+            'notification_sources': [],
         }
         self.assertEqual(NetBoxCircuitMaintenanceConfig.default_settings, expected)
 

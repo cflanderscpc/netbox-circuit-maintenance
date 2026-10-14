@@ -281,6 +281,7 @@ class NotificationSourceView(generic.ObjectView):
     layout = layout.SimpleLayout(
         left_panels=[
             panels.NotificationSourcePanel(),
+            panels.NotificationSourceConfigPanel(),
             TagsPanel(),
         ],
         right_panels=[

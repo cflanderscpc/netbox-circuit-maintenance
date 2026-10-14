@@ -1,0 +1,514 @@
+import datetime
+import email
+import email.policy
+import imaplib
+import re
+import ssl
+from collections.abc import Iterable
+from email.message import Message
+from email.parser import BytesHeaderParser
+from urllib.parse import urlparse
+
+from circuits.models import Provider
+from django.utils import timezone
+from netbox.jobs import JobRunner
+from netbox.plugins import get_plugin_config
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from ..constants import PROVIDER_EMAILS_FIELD
+from ..enum import MessageProcessingStatus
+from ..models import NotificationSource
+from ..utils import split_provider_emails
+
+__all__ = (
+    'IMAP',
+    'EmailSource',
+    'MaintenanceNotification',
+    'RedirectAuthorize',
+    'Source',
+    'get_notifications',
+)
+
+
+class Source(BaseModel):
+    """
+    Base class to retrieve notifications. To be extended for each scheme.
+    """
+
+    # Validation errors are logged and shown on the source's page, so they leave out the input values: a wrongly typed
+    # secret would otherwise appear in them
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    name: str
+    url: str
+    # A dry run leaves the mailbox as it found it: implementations neither tag messages nor mark them as read
+    dry_run: bool = False
+
+    def get_account_id(self) -> str:
+        """
+        Method to get an identifier of the related account.
+        """
+        raise NotImplementedError
+
+    def receive_notifications(
+        self, job: JobRunner, since_timestamp: datetime.datetime | None = None
+    ) -> Iterable['MaintenanceNotification']:
+        """
+        Function to retrieve notifications since one moment in time.
+
+        The `MaintenanceNotification` attributes will contains these attributes:
+        * source: self.name
+        * sender: it could be the email 'from' or omitted if not relevant
+        * subject: it could be the email 'subject' or some meaningful identifier from notification
+        * provider_type: mapping to the Provider that is related to this notification
+        * raw: the raw_payload from notification
+        """
+        # TODO: `senders` is used to limit the scope of emails retrieved, this won't have sense depending on the
+        # Notification Source.
+        raise NotImplementedError
+
+    def validate_providers(self, job: JobRunner, notification_source: NotificationSource, since_txt: str) -> bool:
+        """
+        Method to validate that the NotificationSource has attached Providers.
+
+        Args:
+            job (JobRunner): Job to use its logger
+            notification_source (NotificationSource): Notification Source to validate providers
+            since_txt (str): Date string to be used to log
+
+        Returns:
+            bool: True if there are relevant providers attached or False otherwise
+        """
+        raise NotImplementedError
+
+    def _authentication_logic(self):
+        """
+        Inner method to run the custom class validation logic.
+        """
+        raise NotImplementedError
+
+    def test_authentication(self) -> tuple[bool, str]:
+        """
+        Method to validate the authentication of the Source.
+
+        Returns:
+            Tuple:
+                bool: True if authentication was successful, False otherwise
+                str: Message from authentication execution
+        """
+        try:
+            self._authentication_logic()
+            is_authenticated = True
+            message = 'Test OK'
+        except RedirectAuthorize:
+            raise
+        except Exception as exc:  # noqa: BLE001 (any failure is the test's result)
+            is_authenticated = False
+            # imaplib raises the server's response as bytes, in whatever charset the server chose
+            if exc.args and isinstance(exc.args[0], bytes):
+                message = exc.args[0].decode(errors='replace')
+            else:
+                message = str(exc)
+
+        return is_authenticated, message
+
+    @classmethod
+    def init(cls, name: str, dry_run: bool = False) -> 'Source':
+        """
+        Factory Pattern to get the specific Source Class depending on the scheme.
+        """
+        for notification_source in get_plugin_config('netbox_circuit_maintenance', 'notification_sources'):
+            if notification_source.get('name', '') == name:
+                config = notification_source
+                break
+        else:
+            raise ValueError(f'Name {name} not found in PLUGINS_CONFIG.')
+
+        url = config.get('url')
+        if not url:
+            raise ValueError(f'URL for {name} not found in PLUGINS_CONFIG.')
+
+        url_components = urlparse(url)
+        scheme = url_components.scheme.lower()
+        if scheme == 'imap':
+            return IMAP(
+                name=name,
+                url=url,
+                dry_run=dry_run,
+                account=config.get('account'),
+                password=config.get('secret'),
+                # hostname also handles user info and IPv6 literals
+                imap_server=url_components.hostname,
+                imap_port=url_components.port or 993,
+                source_header=config.get('source_header', 'From'),
+            )
+
+        raise ValueError(f'Scheme {scheme} not supported as Notification Source (only IMAP).')
+
+    def tag_message(self, job: JobRunner, msg_id: str | bytes, tag: MessageProcessingStatus):
+        """
+        If supported, apply the given tag to the given message for future reference and categorization.
+
+        The default implementation of this method is a no-op but specific Source subclasses may implement it. An
+        implementation does nothing in a dry run.
+        """
+
+
+class MaintenanceNotification(BaseModel):
+    """
+    Representation of all the data related to a Maintenance Notification.
+    """
+
+    msg_id: bytes
+    source: Source
+    sender: str
+    subject: str
+    provider_type: str
+    raw_payload: bytes
+    date: str
+
+
+class EmailSource(Source):
+    """
+    Abstract class that shares some methods and attributes across email based sources.
+    """
+
+    account: str
+    emails_to_fetch: list[str] = []
+    source_header: str = 'From'
+
+    def get_account_id(self) -> str:
+        """
+        Method to get an identifier of the related account.
+        """
+        return self.account
+
+    def validate_providers(self, job: JobRunner, notification_source: NotificationSource, since_txt: str) -> bool:
+        """
+        Method to validate that the NotificationSource has attached Providers.
+
+        Args:
+            job (JobRunner): Job to use its logger
+            notification_source (NotificationSource): Notification Source to validate providers
+            since_txt (str): Date string to be used to log
+
+        Returns:
+            bool: True if there are relevant providers attached or False otherwise
+        """
+        providers_with_email = []
+        providers_without_email = []
+        providers = notification_source.providers.all()
+        if not providers:
+            job.logger.warning(
+                f"Skipping source '{notification_source.name}' because no providers were defined.",
+                extra={'object': notification_source},
+            )
+            return False
+
+        for provider in providers:
+            # custom_field_data rather than cf, which costs a custom field query per provider outside a request
+            if provider_emails := split_provider_emails(provider.custom_field_data.get(PROVIDER_EMAILS_FIELD)):
+                self.emails_to_fetch.extend(provider_emails)
+                providers_with_email.append(provider.name)
+            else:
+                providers_without_email.append(provider.name)
+
+        if providers_without_email:
+            job.logger.warning(
+                f'Skipping {", ".join(providers_without_email)} because these providers have no email configured.',
+                extra={'object': notification_source},
+            )
+
+        if not providers_with_email:
+            job.logger.warning(
+                (
+                    f'Skipping Notification Source {notification_source.name} because none of the related providers '
+                    'have emails defined.'
+                ),
+                extra={'object': notification_source},
+            )
+            return False
+        job.logger.debug(f'Fetching emails from {self.emails_to_fetch}')
+        job.logger.info(
+            (
+                f'Retrieving notifications from {notification_source.name} for '
+                f'{", ".join(providers_with_email)} since {since_txt}'
+            ),
+            extra={'object': notification_source},
+        )
+
+        return True
+
+    @staticmethod
+    def extract_email_source(email_source: str) -> str:
+        """
+        Method to get the sender email address.
+        """
+        try:
+            email_source = re.search(r'\<([-A-Za-z0-9_@.]+)\>', email_source).group(1)
+        except AttributeError:
+            try:
+                email_source = re.search(r'([-A-Za-z0-9_@.]+)', email_source).group(1)
+            except AttributeError:
+                return ''
+        return email_source.lower()
+
+    @staticmethod
+    def get_provider_type_from_email(email_source: str) -> str | None:
+        """
+        Return the `Provider` type related to the source: the name of the first Provider, by name, whose emails custom
+        field lists the address.
+        """
+        for name, provider_emails in Provider.objects.values_list(
+            'name', f'custom_field_data__{PROVIDER_EMAILS_FIELD}'
+        ):
+            if email_source in split_provider_emails(provider_emails):
+                return name
+        return None
+
+    def process_email(
+        self, job: JobRunner, email_message: Message, msg_id: str | bytes
+    ) -> MaintenanceNotification | None:
+        """
+        Process an EmailMessage to create the MaintenanceNotification. An email without a sender, Subject or Date is
+        logged and skipped.
+        """
+        # Raw UTF-8 in a header comes back as an email.header.Header, which str() turns into text; the sender's ASCII
+        # address survives it
+        email_source = None
+        if email_message[self.source_header]:
+            email_source = self.extract_email_source(str(email_message[self.source_header]))
+
+        if not email_source:
+            job.logger.error(
+                f'Not possible to determine the email sender from "{self.source_header}: '
+                f'{email_message[self.source_header]}"',
+                extra={'object': email_message},
+            )
+            self.tag_message(job, msg_id, MessageProcessingStatus.UNKNOWN_PROVIDER)
+            return None
+
+        provider_type = self.get_provider_type_from_email(email_source)
+        if not provider_type:
+            job.logger.warning(
+                f'Not possible to determine the provider_type for {email_source}',
+                extra={'object': email_source},
+            )
+            self.tag_message(job, msg_id, MessageProcessingStatus.UNKNOWN_PROVIDER)
+            return None
+
+        if missing_headers := [header for header in ('Subject', 'Date') if email_message[header] is None]:
+            job.logger.error(
+                f'Skipping the email from {email_source} because it has no {" or ".join(missing_headers)} header.',
+                extra={'object': email_message},
+            )
+            self.tag_message(job, msg_id, MessageProcessingStatus.PARSING_FAILED)
+            return None
+
+        raw_payload = email_message.as_bytes()
+        return MaintenanceNotification(
+            source=self,
+            sender=email_source,
+            subject=self.decode_subject(raw_payload),
+            provider_type=provider_type,
+            raw_payload=raw_payload,
+            date=str(email_message['Date']),
+            msg_id=msg_id,
+        )
+
+    @staticmethod
+    def decode_subject(raw_payload: bytes) -> str:
+        """
+        Return the message's Subject as text: encoded words decoded, folding removed and raw UTF-8 read, where the
+        message's own (compat32) header keeps all three as they were sent.
+        """
+        headers = BytesHeaderParser(policy=email.policy.default).parsebytes(raw_payload)
+        return str(headers['Subject'])
+
+
+class IMAP(EmailSource):
+    """
+    IMAP class, extending Source class.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    password: str = Field(..., repr=False)
+    imap_server: str
+    imap_port: int = 993
+
+    session: imaplib.IMAP4_SSL | None = None
+
+    def open_session(self):
+        """
+        Open session to IMAP server, verifying its certificate and hostname (imaplib's default context checks neither).
+
+        See states: https://github.com/python/cpython/blob/3.12/Lib/imaplib.py#L58
+        """
+        if not self.session:
+            self.session = imaplib.IMAP4_SSL(self.imap_server, self.imap_port, ssl_context=ssl.create_default_context())
+        if self.session.state == 'NONAUTH':
+            self.session.login(self.account, self.password)
+
+    def close_session(self):
+        """
+        Close session to IMAP server.
+
+        See states: https://github.com/python/cpython/blob/3.12/Lib/imaplib.py#L58
+        """
+        if self.session:
+            if self.session.state == 'SELECTED':
+                self.session.close()
+            if self.session.state == 'AUTH':
+                self.session.logout()
+
+    def _authentication_logic(self):
+        """
+        Inner method to run the custom class validation logic.
+        """
+        self.open_session()
+        self.close_session()
+
+    def fetch_email(self, job: JobRunner, msg_id: bytes) -> MaintenanceNotification | None:
+        """
+        Fetch an specific email ID.
+        """
+        _, data = self.session.fetch(msg_id, '(RFC822)')
+        email_message = email.message_from_bytes(data[0][1])
+
+        return self.process_email(job, email_message, msg_id)
+
+    def receive_notifications(
+        self, job: JobRunner, since_timestamp: datetime.datetime | None = None
+    ) -> Iterable[MaintenanceNotification]:
+        """
+        Retrieve emails since an specific time, if provided.
+        """
+        self.open_session()
+
+        # Define searching criteria. Fetching a message marks it as read, unless a dry run opens the Inbox read-only
+        # (IMAP EXAMINE)
+        self.session.select('Inbox', readonly=self.dry_run)
+
+        # TODO: find the right way to search messages from several senders
+        # Maybe extend filtering options, for instance, to discard some type of notifications
+        msg_ids = []
+
+        # TODO: define a similar function to _get_search_criteria
+        since_date = ''
+        if since_timestamp:
+            since_txt = since_timestamp.strftime('%d-%b-%Y')
+            since_date = f'SINCE "{since_txt}"'
+
+        if self.emails_to_fetch:
+            for sender in self.emails_to_fetch:
+                if self.source_header == 'From':
+                    search_items = (f'FROM "{sender}"', since_date)
+                else:
+                    search_items = (f'HEADER {self.source_header} "{sender}"', since_date)
+                search_text = ' '.join(search_items).strip()
+                search_criteria = f'({search_text})'
+                messages = self.session.search(None, search_criteria)[1][0]
+                msg_ids.extend(messages.split())
+                job.logger.debug(
+                    f'Fetched {len(messages.split())} emails from {self.name}'
+                    f' source using search pattern: {search_criteria}.'
+                )
+        else:
+            search_criteria = f'({since_date})'
+            messages = self.session.search(None, search_criteria)[1][0]
+            msg_ids.extend(messages.split())
+            job.logger.debug(
+                f'Fetched {len(messages.split())} emails from {self.name} '
+                f'source using search pattern: {search_criteria}.'
+            )
+
+        received_notifications = []
+        for msg_id in msg_ids:
+            raw_notification = self.fetch_email(job, msg_id)
+            if raw_notification:
+                received_notifications.append(raw_notification)
+
+        job.logger.debug(f'Raw notifications created {len(received_notifications)} from {self.name}.')
+
+        self.close_session()
+        return received_notifications
+
+
+class RedirectAuthorize(Exception):
+    """
+    Custom class to signal a redirect to trigger OAuth autorization workflow for a specific source_name.
+    """
+
+    def __init__(self, url_name, source_name):
+        """
+        Init for RedirectAuthorize.
+        """
+        self.url_name = url_name
+        self.source_name = source_name
+        super().__init__()
+
+
+def get_notifications(
+    job: JobRunner,
+    notification_sources: Iterable[NotificationSource],
+    since: int,
+    dry_run: bool = False,
+) -> Iterable[MaintenanceNotification]:
+    """
+    Method to fetch notifications from multiple sources and return MaintenanceNotification objects.
+    """
+    received_notifications = []
+
+    for notification_source in notification_sources:
+        try:
+            since_date = datetime.datetime.fromtimestamp(since, tz=timezone.get_default_timezone())
+            since_txt = since_date.strftime('%d-%b-%Y')
+
+            try:
+                source = Source.init(name=notification_source.name, dry_run=dry_run)
+            except ValidationError as validation_error:
+                job.logger.warning(
+                    (
+                        f'Notification Source {notification_source.name} '
+                        f'is not matching class expectations: {validation_error}'
+                    ),
+                    extra={'object': notification_source},
+                    exc_info=True,
+                )
+                continue
+            except ValueError as exc:
+                # NetBox's job log keeps only the message, not the traceback, so the message carries the reason
+                job.logger.warning(
+                    f'Skipping notification source {notification_source}: {exc}',
+                    extra={'object': notification_source},
+                    exc_info=True,
+                )
+                continue
+
+            if source.validate_providers(job, notification_source, since_txt):
+                # When using the SINCE filter, we add one extra day to check for notifications received
+                # on the very same day since last notification.
+                since_date -= datetime.timedelta(days=1)
+
+                raw_notifications = source.receive_notifications(job, since_date)
+                received_notifications.extend(raw_notifications)
+
+                if not raw_notifications:
+                    job.logger.info(
+                        (
+                            f'No notifications received for '
+                            f'{", ".join(notification_source.providers.all().values_list("name", flat=True))} since '
+                            f'{since_txt} from {notification_source.name}'
+                        ),
+                        extra={'object': notification_source},
+                    )
+
+        except Exception:
+            job.logger.exception(
+                f'Issue fetching notifications from {notification_source.name}',
+                extra={'object': notification_source},
+            )
+            raise
+
+    return received_notifications

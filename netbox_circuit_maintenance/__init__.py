@@ -26,6 +26,8 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
         'job_interval': None,
         # Username that scheduled handler runs record their changes as; None means those runs record no change log
         'job_user': None,
+        # The mailboxes to fetch notifications from: a dict per source, matched to a NotificationSource by name
+        'notification_sources': [],
     }
 
     def ready(self):
