@@ -28,5 +28,11 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
         'job_user': None,
     }
 
+    def ready(self):
+        super().ready()
+
+        # Connect the signal receivers
+        from . import signals
+
 
 config = NetBoxCircuitMaintenanceConfig
