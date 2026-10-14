@@ -1,14 +1,19 @@
 from circuit_maintenance_parser import SUPPORTED_PROVIDER_NAMES
 from circuits.models import Provider
 from django.core.exceptions import ValidationError
+from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils.translation import gettext_lazy as _
 from netbox.signals import post_clean
 
 from .constants import PROVIDER_EMAILS_FIELD, PROVIDER_PARSER_FIELD
+from .models import NotificationSource
 from .utils import split_provider_emails
 
-__all__ = ('validate_provider',)
+__all__ = (
+    'add_provider_to_email_sources',
+    'validate_provider',
+)
 
 
 @receiver(post_clean, sender=Provider)
@@ -49,3 +54,18 @@ def validate_provider(sender, instance, **kwargs):
     # keyed on a missing form field raised ValueError
     if errors:
         raise ValidationError(errors)
+
+
+@receiver(post_save, sender=Provider)
+def add_provider_to_email_sources(sender, instance, created, raw=False, **kwargs):
+    """
+    Add a new Provider to every NotificationSource that attaches all providers. Like NetBox's own receivers, skip raw
+    saves: loaddata makes them while other rows may not be loaded yet.
+    """
+    if not created or raw:
+        return
+
+    for source in NotificationSource.objects.filter(attach_all_providers=True):
+        # Record the source's providers before the change, as NetBox does when a signal changes a related object
+        source.snapshot()
+        source.providers.add(instance)

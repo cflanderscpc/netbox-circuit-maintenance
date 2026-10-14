@@ -1,5 +1,12 @@
+import json
+from unittest.mock import patch
+
 from circuit_maintenance_parser import SUPPORTED_PROVIDER_NAMES
 from circuits.models import Provider
+from core.choices import ObjectChangeActionChoices
+from core.events import OBJECT_UPDATED
+from core.models import ObjectChange, ObjectType
+from django.core import serializers
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.db import connection
 from django.test import TestCase
@@ -13,7 +20,9 @@ from rest_framework import status
 from utilities.testing import APITestCase, post_data
 from utilities.testing import TestCase as ViewTestCase
 
-# These tests don't import netbox_circuit_maintenance.signals: importing it would connect the receiver whether or not
+from netbox_circuit_maintenance.models import NotificationSource
+
+# These tests don't import netbox_circuit_maintenance.signals: importing it would connect the receivers whether or not
 # PluginConfig.ready() does
 
 EMAILS = 'emails_circuit_maintenances'
@@ -285,3 +294,106 @@ class ProviderValidationAPITestCase(APITestCase):
         response = self.client.post(reverse('circuits-api:provider-list'), data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_201_CREATED)
         self.assertEqual(Provider.objects.filter(custom_field_data__emails_circuit_maintenances='new@x.com').count(), 2)
+
+
+def get_source_changes(source):
+    return ObjectChange.objects.filter(
+        changed_object_type=ObjectType.objects.get_for_model(NotificationSource), changed_object_id=source.pk
+    )
+
+
+class AddProviderToSourcesTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.sources = (
+            NotificationSource.objects.create(name='Source 1', attach_all_providers=True),
+            NotificationSource.objects.create(name='Source 2'),
+            NotificationSource.objects.create(name='Source 3', attach_all_providers=True),
+        )
+
+    def test_create(self):
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        self.assertEqual(list(provider.maintenance_notification_sources.all()), [self.sources[0], self.sources[2]])
+
+    def test_update(self):
+        # Only a new provider is added, so one taken off a source stays off when it's saved again
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        self.sources[0].providers.remove(provider)
+        provider.description = 'New description'
+        provider.save()
+        self.assertEqual(list(provider.maintenance_notification_sources.all()), [self.sources[2]])
+
+    def test_fixture(self):
+        # loaddata saves each object with raw=True, so nothing is added; Nautobot added it
+        data = json.dumps([{'model': 'circuits.provider', 'fields': {'name': 'Provider 1', 'slug': 'provider-1'}}])
+        for obj in serializers.deserialize('json', data):
+            obj.save()
+        provider = Provider.objects.get(slug='provider-1')
+        self.assertFalse(provider.maintenance_notification_sources.exists())
+
+
+class AddProviderToSourcesViewTestCase(ViewTestCase):
+    def test_create_changelog(self):
+        # The source records an update with its providers before and after, under the user who added the provider, who
+        # needs no permission on sources
+        source = NotificationSource.objects.create(name='Source 1', attach_all_providers=True)
+        provider1 = Provider.objects.create(name='Provider 1', slug='provider-1')
+        self.add_permissions('circuits.add_provider')
+
+        response = self.client.post(
+            reverse('circuits:provider_add'), post_data({'name': 'Provider 2', 'slug': 'provider-2'})
+        )
+        self.assertHttpStatus(response, 302)
+        provider2 = Provider.objects.get(slug='provider-2')
+        self.assertEqual(
+            [
+                (change.action, change.user, change.prechange_data['providers'], change.postchange_data['providers'])
+                for change in get_source_changes(source)
+            ],
+            [(ObjectChangeActionChoices.ACTION_UPDATE, self.user, [provider1.pk], [provider1.pk, provider2.pk])],
+        )
+
+
+class AddProviderToSourcesAPITestCase(APITestCase):
+    def test_bulk_create_changelog(self):
+        # NetBox merges a source's changes within one request into one record
+        sources = (
+            NotificationSource.objects.create(name='Source 1', attach_all_providers=True),
+            NotificationSource.objects.create(name='Source 2', attach_all_providers=True),
+        )
+        self.add_permissions('circuits.add_provider')
+        data = [{'name': f'Provider {i}', 'slug': f'provider-{i}'} for i in (1, 2)]
+
+        response = self.client.post(reverse('circuits-api:provider-list'), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        provider_pks = [provider['id'] for provider in response.data]
+        for source in sources:
+            with self.subTest(source=source.name):
+                self.assertEqual(
+                    [
+                        (change.action, change.prechange_data['providers'], change.postchange_data['providers'])
+                        for change in get_source_changes(source)
+                    ],
+                    [(ObjectChangeActionChoices.ACTION_UPDATE, [], provider_pks)],
+                )
+
+    def test_bulk_create_events(self):
+        # Event rules on source updates get one event per source, with its providers before and after. The default
+        # EVENTS_PIPELINE entry is patched rather than queueing jobs in Redis
+        source = NotificationSource.objects.create(name='Source 1', attach_all_providers=True)
+        self.add_permissions('circuits.add_provider')
+        data = [{'name': f'Provider {i}', 'slug': f'provider-{i}'} for i in (1, 2)]
+
+        with patch('extras.events.process_event_queue') as process_event_queue:
+            response = self.client.post(reverse('circuits-api:provider-list'), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        events = [
+            (
+                event['event_type'],
+                event['snapshots']['prechange']['providers'],
+                event['snapshots']['postchange']['providers'],
+            )
+            for event in process_event_queue.call_args.args[0]
+            if event['object'] == source
+        ]
+        self.assertEqual(events, [(OBJECT_UPDATED, [], [provider['id'] for provider in response.data])])
