@@ -1,6 +1,8 @@
 import csv
 import io
 import json
+import os
+import tempfile
 import uuid
 from datetime import UTC, date, datetime, time, timedelta
 from unittest.mock import patch
@@ -778,6 +780,47 @@ class NotificationSourceTestCase(
                 self.assertContains(response, error)
                 self.assertNotContains(response, '12345678')
                 self.assertTrue(logs.output[0].startswith(f'WARNING:netbox_circuit_maintenance.ui.panels:{error[:40]}'))
+
+    def test_get_object_configuration_gmail(self):
+        # The credentials file's type picks the Gmail source class
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        config = {'name': 'Source 1', 'url': 'https://accounts.google.com/o/oauth2/auth', 'account': 'noc@example.com'}
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {}
+            for name, credentials in (
+                ('service_account', {'type': 'service_account'}),
+                ('oauth', {'web': {}}),
+                ('installed', {'installed': {}}),
+            ):
+                paths[name] = os.path.join(directory, f'{name}.json')
+                with open(paths[name], 'w') as file:
+                    json.dump(credentials, file)
+
+            for name, source_type in (('service_account', 'GmailAPIServiceAccount'), ('oauth', 'GmailAPIOauth')):
+                with (
+                    self.subTest(source_type=source_type),
+                    plugin_settings(notification_sources=[{**config, 'credentials_file': paths[name]}]),
+                    self.assertNoLogs('netbox_circuit_maintenance'),
+                ):
+                    response = self.client.get(source.get_absolute_url())
+                    self.assertHttpStatus(response, 200)
+                    self.assertContains(response, f'<th scope="row">Type</th><td>{source_type}</td>', html=True)
+                    self.assertContains(response, '<th scope="row">Account ID</th><td>noc@example.com</td>', html=True)
+                    self.assertNotContains(response, 'Authentication status')
+
+            # An unsupported credentials file is reported on the page (Nautobot's NotImplementedError was a 500)
+            with (
+                plugin_settings(notification_sources=[{**config, 'credentials_file': paths['installed']}]),
+                self.assertLogs('netbox_circuit_maintenance.ui.panels', 'WARNING'),
+            ):
+                response = self.client.get(source.get_absolute_url())
+            self.assertHttpStatus(response, 200)
+            self.assertContains(
+                response,
+                f'Failed to initialize source: File {paths["installed"]} doesn&#x27;t contain any supported credentials.',
+            )
 
     # The form only offers providers the user can view
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
