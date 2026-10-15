@@ -1,4 +1,6 @@
+import base64
 import csv
+import hashlib
 import io
 import json
 import os
@@ -6,9 +8,11 @@ import tempfile
 import uuid
 from datetime import UTC, date, datetime, time, timedelta
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
+import requests
 from circuits.models import Circuit, CircuitTermination, CircuitType, Provider
-from core.models import ObjectType
+from core.models import ObjectChange, ObjectType
 from dcim.models import (
     Cable,
     Device,
@@ -22,15 +26,19 @@ from dcim.models import (
     Site,
 )
 from django.conf import settings
+from django.contrib.messages import ERROR, SUCCESS, get_messages
 from django.test import RequestFactory, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from google.auth.exceptions import RefreshError
+from google.oauth2.credentials import Credentials
 from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
 from netbox.context_managers import event_tracking
 from users.models import ObjectPermission
 from utilities.testing import ModelViewTestCase, ViewTestCases, create_tags, post_data
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.handle_notifications.sources import IMAP
 from netbox_circuit_maintenance.models import (
     CircuitImpact,
     CircuitMaintenance,
@@ -39,12 +47,42 @@ from netbox_circuit_maintenance.models import (
     ParsedNotification,
     RawNotification,
 )
-from netbox_circuit_maintenance.views import CircuitMaintenanceOverviewView
+from netbox_circuit_maintenance.views import GOOGLE_OAUTH_SESSION_KEY, CircuitMaintenanceOverviewView
 
+from .test_sources import (
+    OAUTH_CLIENT_SECRETS,
+    SOURCE_GMAIL_API_OAUTH,
+    SOURCE_GMAIL_API_SERVICE_ACCOUNT,
+    GmailSourcesMixin,
+    write_file,
+)
 from .utils import plugin_settings
 
 START = datetime(2020, 10, 4, 10, 0, tzinfo=UTC)
 END = START + timedelta(hours=2)
+
+GMAIL_READONLY_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify'
+
+
+def get_message_list(response):
+    """
+    The messages of the response's request, as (level, message) pairs: the ones it added, and any earlier ones that no
+    page has shown yet.
+    """
+    return [(message.level, message.message) for message in get_messages(response.wsgi_request)]
+
+
+def token_response(status=200, **body):
+    """
+    A response from Google's OAuth token endpoint.
+    """
+    response = requests.Response()
+    response.request = requests.Request('POST', OAUTH_CLIENT_SECRETS['web']['token_uri']).prepare()
+    response.status_code = status
+    response.headers['Content-Type'] = 'application/json'
+    response._content = json.dumps(body).encode()
+    return response
 
 
 class PluginViewTestMixin:
@@ -919,6 +957,453 @@ class NotificationSourceTestCase(
         self.assertFalse(NotificationSource.objects.filter(pk=source.pk).exists())
         raw_notification.refresh_from_db()
         self.assertIsNone(raw_notification.source)
+
+    def test_get_object_validate_button(self):
+        # Nautobot's test_custom_actions. Validating needs only view permission, as the page does
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.get(source.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Validate Authentication')
+        # A form posting the CSRF token
+        self.assertRegex(
+            response.content.decode(),
+            rf'<form action="{self._get_url("validate", source)}" method="post">\s*'
+            r'<input type="hidden" name="csrfmiddlewaretoken" value="\w+">',
+        )
+
+    @patch.object(IMAP, '_authentication_logic', autospec=True)
+    def test_validate_object(self, authentication_logic):
+        # Nautobot's test_validate_view_ok and test_validate_view_ko. The result is a message on the source's page
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.post(self._get_url('validate', source))
+        self.assertRedirects(response, source.get_absolute_url())
+        self.assertEqual(get_message_list(response), [(SUCCESS, 'SUCCESS: Test OK')])
+        authentication_logic.assert_called_once()
+
+        authentication_logic.side_effect = ConnectionRefusedError('Some error')
+        response = self.client.post(self._get_url('validate', source), follow=True)
+        self.assertContains(response, 'FAILED: Some error')
+        self.assertEqual(
+            [(message.level, message.message) for message in response.context['messages']],
+            [(ERROR, 'FAILED: Some error')],
+        )
+
+    @patch.object(IMAP, '_authentication_logic', autospec=True)
+    def test_validate_object_return_url(self, authentication_logic):
+        source = NotificationSource.objects.get(name='Source 1')
+        list_url = self._get_url('list')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.post(f'{self._get_url("validate", source)}?return_url={list_url}')
+        self.assertRedirects(response, list_url)
+        # Only to this site's pages (Nautobot redirected to any return_url)
+        response = self.client.post(f'{self._get_url("validate", source)}?return_url=https://example.com/')
+        self.assertRedirects(response, source.get_absolute_url())
+
+    @patch.object(IMAP, '_authentication_logic', autospec=True)
+    def test_validate_object_get(self, authentication_logic):
+        # Only a POST validates
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.get(self._get_url('validate', source))
+        self.assertRedirects(response, source.get_absolute_url())
+        authentication_logic.assert_not_called()
+        self.assertEqual(get_message_list(response), [])
+
+    @plugin_settings(notification_sources=[])
+    def test_validate_object_configuration_error(self):
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.post(self._get_url('validate', source))
+        # The page's Configuration panel reports the error too
+        with self.assertLogs('netbox_circuit_maintenance.ui.panels', 'WARNING'):
+            self.assertRedirects(response, source.get_absolute_url())
+        self.assertEqual(get_message_list(response), [(ERROR, 'FAILED: Name Source 1 not found in PLUGINS_CONFIG.')])
+
+    @patch.object(IMAP, '_authentication_logic', autospec=True)
+    def test_validate_object_permissions(self, authentication_logic):
+        source = NotificationSource.objects.get(name='Source 1')
+
+        response = self.client.post(self._get_url('validate', source))
+        self.assertHttpStatus(response, 403)
+
+        # Only the sources the user can view
+        obj_perm = ObjectPermission(name='Test permission', constraints={'name': 'Source 2'}, actions=['view'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(NotificationSource))
+        response = self.client.post(self._get_url('validate', source))
+        self.assertHttpStatus(response, 404)
+        authentication_logic.assert_not_called()
+
+
+class NotificationSourceGoogleOAuthTestCase(GmailSourcesMixin, PluginViewTestMixin, ModelViewTestCase):
+    """
+    Validate, authorize and the OAuth callback with a Google OAuth source. oauthlib runs for real; only Google's token
+    endpoint (requests) and the token refresh are mocked.
+    """
+
+    model = NotificationSource
+    # Google's token endpoint's answer to the authorization code
+    TOKEN = {
+        'access_token': 'access-token',
+        'expires_in': 3599,
+        'refresh_token': 'refresh-token',
+        'scope': GMAIL_READONLY_SCOPE,
+        'token_type': 'Bearer',
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.source = NotificationSource.objects.create(name=SOURCE_GMAIL_API_OAUTH['name'])
+        cls.service_account_source = NotificationSource.objects.create(name=SOURCE_GMAIL_API_SERVICE_ACCOUNT['name'])
+
+    @staticmethod
+    def refresh(credentials, request):
+        # Stands in for google-auth's request to Google's token endpoint
+        credentials.token = 'new-access-token'
+        credentials.expiry = datetime(2031, 1, 1)  # noqa: DTZ001 (google-auth's naive UTC)
+
+    def authorize(self):
+        """
+        Start the source's authorization over HTTPS, and return the state Google sends back to the callback.
+        """
+        response = self.client.get(self._get_url('google_authorize', self.source), secure=True)
+        self.assertHttpStatus(response, 302)
+        return self.client.session[GOOGLE_OAUTH_SESSION_KEY]['state']
+
+    def callback(self, params, token=None, secure=True, refresh=None):
+        """
+        Send the user back from Google with the given query parameters. The token endpoint answers with the token
+        response (by default TOKEN), or raises it if it's an exception. Validating calls refresh() (by default
+        self.refresh()) for the token refresh.
+        """
+        # Not "token or": a Response is false for an error status
+        if token is None:
+            token = token_response(**self.TOKEN)
+        with (
+            patch.object(
+                requests.Session,
+                'request',
+                autospec=True,
+                return_value=token,
+                side_effect=token if isinstance(token, Exception) else None,
+            ) as token_request,
+            patch.object(Credentials, 'refresh', autospec=True, side_effect=refresh or self.refresh),
+        ):
+            response = self.client.get(self._get_url('google_oauth2callback'), params, secure=secure)
+        return response, token_request
+
+    def get_token(self):
+        return NotificationSource.objects.get(pk=self.source.pk)._token
+
+    def test_validate_unauthorized(self):
+        # A source without a token goes on to its authorization, which needs permission to change the source
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        error = f'FAILED: {self.source} needs Google OAuth authorization by a user who can change it.'
+
+        response = self.client.post(self._get_url('validate', self.source))
+        self.assertRedirects(response, self.source.get_absolute_url())
+        self.assertEqual(get_message_list(response), [(ERROR, error)])
+
+        obj_perm = ObjectPermission(
+            name='Test permission', constraints={'name': self.service_account_source.name}, actions=['change']
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(NotificationSource))
+        response = self.client.post(self._get_url('validate', self.source))
+        self.assertRedirects(response, self.source.get_absolute_url())
+        self.assertEqual(get_message_list(response), [(ERROR, error)])
+
+        # Permission to change this source
+        obj_perm.constraints = {'name': self.source.name}
+        obj_perm.save()
+        response = self.client.post(self._get_url('validate', self.source))
+        self.assertRedirects(response, self._get_url('google_authorize', self.source), fetch_redirect_response=False)
+        self.assertEqual(get_message_list(response), [])
+
+    def test_authorize(self):
+        self.add_permissions('netbox_circuit_maintenance.change_notificationsource')
+
+        with plugin_settings(notification_sources=[{**self.config_oauth, 'extra_scopes': [GMAIL_MODIFY_SCOPE]}]):
+            response = self.client.get(self._get_url('google_authorize', self.source), secure=True)
+        self.assertHttpStatus(response, 302)
+        authorization = self.client.session[GOOGLE_OAUTH_SESSION_KEY]
+        url = urlsplit(response.url)
+        self.assertEqual(f'{url.scheme}://{url.netloc}{url.path}', OAUTH_CLIENT_SECRETS['web']['auth_uri'])
+        code_challenge = base64.urlsafe_b64encode(hashlib.sha256(authorization['code_verifier'].encode()).digest())
+        self.assertEqual(
+            parse_qs(url.query),
+            {
+                'response_type': ['code'],
+                'client_id': ['client-id'],
+                'redirect_uri': [
+                    'https://testserver/plugins/circuit-maintenance/notification-sources/google-oauth2callback/'
+                ],
+                'scope': [f'{GMAIL_READONLY_SCOPE} {GMAIL_MODIFY_SCOPE}'],
+                'state': [authorization['state']],
+                'code_challenge': [code_challenge.decode().rstrip('=')],
+                'code_challenge_method': ['S256'],
+                'access_type': ['offline'],
+                'prompt': ['consent'],
+            },
+        )
+        self.assertEqual(authorization['source'], self.source.pk)
+
+    def test_authorize_errors(self):
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+        )
+        incomplete_file = write_file(self.directory, 'incomplete.json', {'web': {'client_id': 'client-id'}})
+        web = {key: value for key, value in OAUTH_CLIENT_SECRETS['web'].items() if key != 'client_secret'}
+        no_secret_file = write_file(self.directory, 'no_secret.json', {'web': web})
+
+        for source, notification_sources, error in (
+            (
+                self.service_account_source,
+                [self.config_service_account],
+                f'FAILED: {self.service_account_source} is not a Google OAuth source.',
+            ),
+            (
+                self.source,
+                [{**self.config_oauth, 'credentials_file': incomplete_file}],
+                'FAILED: Client secrets is not in the correct format.',
+            ),
+            # Reported before the user's consent: the token request needs it
+            (
+                self.source,
+                [{**self.config_oauth, 'credentials_file': no_secret_file}],
+                f'FAILED: Credentials_file {no_secret_file} for {self.source} has no client_secret.',
+            ),
+        ):
+            with self.subTest(error=error), plugin_settings(notification_sources=notification_sources):
+                response = self.client.get(self._get_url('google_authorize', source))
+                self.assertRedirects(response, source.get_absolute_url())
+                self.assertEqual(get_message_list(response), [(ERROR, error)])
+                self.assertNotIn(GOOGLE_OAUTH_SESSION_KEY, self.client.session)
+
+        with plugin_settings(notification_sources=[]):
+            response = self.client.get(self._get_url('google_authorize', self.source))
+            # The page's Configuration panel reports the error too
+            with self.assertLogs('netbox_circuit_maintenance.ui.panels', 'WARNING'):
+                self.assertRedirects(response, self.source.get_absolute_url())
+        self.assertEqual(
+            get_message_list(response), [(ERROR, f'FAILED: Name {self.source} not found in PLUGINS_CONFIG.')]
+        )
+        self.assertNotIn(GOOGLE_OAUTH_SESSION_KEY, self.client.session)
+
+    def test_authorize_permissions(self):
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+
+        response = self.client.get(self._get_url('google_authorize', self.source))
+        self.assertHttpStatus(response, 403)
+
+        # Only the sources the user can change
+        obj_perm = ObjectPermission(
+            name='Test permission', constraints={'name': self.service_account_source.name}, actions=['change']
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(NotificationSource))
+        response = self.client.get(self._get_url('google_authorize', self.source))
+        self.assertHttpStatus(response, 404)
+        self.assertNotIn(GOOGLE_OAUTH_SESSION_KEY, self.client.session)
+
+    def test_authorization(self):
+        # Validate, authorize, consent at Google, then the callback stores the token and validates the source
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+        )
+        last_updated = NotificationSource.objects.get(pk=self.source.pk).last_updated
+        response = self.client.post(self._get_url('validate', self.source), secure=True)
+        self.assertRedirects(response, self._get_url('google_authorize', self.source), fetch_redirect_response=False)
+        state = self.authorize()
+        code_verifier = self.client.session[GOOGLE_OAUTH_SESSION_KEY]['code_verifier']
+
+        with patch('extras.events.process_event_queue') as process_event_queue:
+            response, token_request = self.callback({'state': state, 'code': 'authorization-code'})
+        self.assertRedirects(response, self.source.get_absolute_url())
+        self.assertEqual(get_message_list(response), [(SUCCESS, 'SUCCESS: Test OK')])
+        # The code is exchanged with the PKCE code verifier, at the redirect URI the authorization used
+        self.assertEqual(token_request.call_args.args[1:], ('POST', OAUTH_CLIENT_SECRETS['web']['token_uri']))
+        self.assertEqual(
+            token_request.call_args.kwargs['data'],
+            {
+                'grant_type': 'authorization_code',
+                'code': 'authorization-code',
+                'redirect_uri': 'https://testserver/plugins/circuit-maintenance/notification-sources/google-oauth2callback/',
+                'code_verifier': code_verifier,
+            },
+        )
+        # Validating refreshed the stored token
+        token = self.get_token()
+        self.assertEqual(
+            (token['token'], token['refresh_token'], token['client_id'], token['scopes']),
+            ('new-access-token', 'refresh-token', 'client-id', [GMAIL_READONLY_SCOPE]),
+        )
+        # Stored as a refresh is: no change record, event or new last_updated (user's choice)
+        self.assertEqual(NotificationSource.objects.get(pk=self.source.pk).last_updated, last_updated)
+        self.assertFalse(
+            ObjectChange.objects.filter(
+                changed_object_type=ObjectType.objects.get_for_model(NotificationSource),
+                changed_object_id=self.source.pk,
+            ).exists()
+        )
+        process_event_queue.assert_not_called()
+        # An authorization completes once
+        self.assertNotIn(GOOGLE_OAUTH_SESSION_KEY, self.client.session)
+        response, token_request = self.callback({'state': state, 'code': 'authorization-code'})
+        self.assertRedirects(response, self._get_url('list'))
+        self.assertEqual(get_message_list(response), [(ERROR, 'No Google OAuth authorization is in progress.')])
+        token_request.assert_not_called()
+
+    def test_callback_errors(self):
+        # Reported on the source's page (Nautobot's callback answered each with a 500)
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+        )
+        for description, params, token, secure, error in (
+            ('consent denied', {'error': 'access_denied'}, None, True, 'FAILED: access_denied'),
+            (
+                'another state',
+                {'state': 'other-state', 'code': 'authorization-code'},
+                None,
+                True,
+                'FAILED: mismatching_state: CSRF Warning! State not equal in request and response.',
+            ),
+            (
+                'code rejected',
+                {'code': 'authorization-code'},
+                token_response(400, error='invalid_grant', error_description='Bad Request'),
+                True,
+                'FAILED: invalid_grant: Bad Request',
+            ),
+            (
+                'token endpoint unreachable',
+                {'code': 'authorization-code'},
+                requests.ConnectionError('Connection refused'),
+                True,
+                'FAILED: Connection refused',
+            ),
+            (
+                'over HTTP',
+                {'code': 'authorization-code'},
+                None,
+                False,
+                'FAILED: insecure_transport: OAuth 2 MUST utilize https.',
+            ),
+        ):
+            with self.subTest(description):
+                state = self.authorize()
+                response, _token_request = self.callback({'state': state, **params}, token=token, secure=secure)
+                self.assertRedirects(response, self.source.get_absolute_url())
+                self.assertEqual(get_message_list(response), [(ERROR, error)])
+                self.assertIsNone(self.get_token())
+                self.assertNotIn(GOOGLE_OAUTH_SESSION_KEY, self.client.session)
+
+    def test_callback_other_scopes(self):
+        # oauthlib refuses a token for other scopes than the requested ones. Without include_granted_scopes, that
+        # happens when the user deselects one of them on Google's consent screen
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+        )
+
+        with plugin_settings(notification_sources=[{**self.config_oauth, 'extra_scopes': [GMAIL_MODIFY_SCOPE]}]):
+            state = self.authorize()
+            response, _token_request = self.callback({'state': state, 'code': 'authorization-code'})
+        self.assertRedirects(response, self.source.get_absolute_url())
+        # oauthlib lists each set of scopes in no particular order
+        [(level, message)] = get_message_list(response)
+        self.assertEqual(level, ERROR)
+        self.assertTrue(message.startswith('FAILED: Scope has changed from "'), message)
+        self.assertTrue(message.endswith(f'" to "{GMAIL_READONLY_SCOPE}".'), message)
+        self.assertIsNone(self.get_token())
+
+    def test_callback_without_refresh_token(self):
+        # The source couldn't load the token, so it keeps the one it has
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+        )
+        token = {key: value for key, value in self.TOKEN.items() if key != 'refresh_token'}
+        previous_token = {'token': 'previous-access-token', 'refresh_token': 'previous-refresh-token'}
+        NotificationSource.objects.filter(pk=self.source.pk).update(_token=previous_token)
+
+        state = self.authorize()
+        response, _token_request = self.callback(
+            {'state': state, 'code': 'authorization-code'}, token=token_response(**token)
+        )
+        self.assertRedirects(response, self.source.get_absolute_url())
+        self.assertEqual(get_message_list(response), [(ERROR, 'FAILED: Google returned no refresh token.')])
+        self.assertEqual(self.get_token(), previous_token)
+
+    def test_callback_refresh_error(self):
+        # Validating the new token fails: the token is discarded, as a failed refresh in Validate does
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+        )
+        error = RefreshError(
+            'invalid_grant: Token has been expired or revoked.',
+            {'error': 'invalid_grant', 'error_description': 'Token has been expired or revoked.'},
+            retryable=False,
+        )
+
+        state = self.authorize()
+        response, _token_request = self.callback({'state': state, 'code': 'authorization-code'}, refresh=error)
+        self.assertRedirects(response, self.source.get_absolute_url())
+        self.assertEqual(
+            get_message_list(response), [(ERROR, 'FAILED: invalid_grant: Token has been expired or revoked.')]
+        )
+        self.assertIsNone(self.get_token())
+
+    def test_callback_configuration_changed(self):
+        # The source's configuration changed between the authorization's start and the callback
+        self.add_permissions(
+            'netbox_circuit_maintenance.view_notificationsource',
+            'netbox_circuit_maintenance.change_notificationsource',
+        )
+
+        state = self.authorize()
+        with plugin_settings(notification_sources=[]):
+            response, token_request = self.callback({'state': state, 'code': 'authorization-code'})
+            # The page's Configuration panel reports the error too
+            with self.assertLogs('netbox_circuit_maintenance.ui.panels', 'WARNING'):
+                self.assertRedirects(response, self.source.get_absolute_url())
+        self.assertEqual(
+            get_message_list(response), [(ERROR, f'FAILED: Name {self.source} not found in PLUGINS_CONFIG.')]
+        )
+        token_request.assert_not_called()
+        self.assertIsNone(self.get_token())
+
+    def test_callback_permissions(self):
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        response = self.client.get(self._get_url('google_oauth2callback'))
+        self.assertHttpStatus(response, 403)
+
+        # The source in the session must be one the user can change
+        obj_perm = ObjectPermission(name='Test permission', constraints={'name': self.source.name}, actions=['change'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(NotificationSource))
+        state = self.authorize()
+        obj_perm.constraints = {'name': self.service_account_source.name}
+        obj_perm.save()
+        response, token_request = self.callback({'state': state, 'code': 'authorization-code'})
+        self.assertHttpStatus(response, 404)
+        token_request.assert_not_called()
+        self.assertIsNone(self.get_token())
 
 
 class RawNotificationTestCase(

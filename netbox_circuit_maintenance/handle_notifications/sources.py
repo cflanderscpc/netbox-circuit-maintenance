@@ -874,18 +874,19 @@ class GmailAPIOauth(GmailAPI):
                     self.credentials.refresh(Request())
                 except RefreshError:
                     # Bad token, discard it
-                    self._store_token(notification_source, None)
+                    self.store_token(notification_source, None)
                     raise
 
-                self._store_token(notification_source, json.loads(self.credentials.to_json()))
+                self.store_token(notification_source, json.loads(self.credentials.to_json()))
             else:
                 raise RedirectAuthorize(url_name='google_authorize', source_name=self.name)
 
     @staticmethod
-    def _store_token(notification_source, token):
+    def store_token(notification_source, token):
         """
         Save the token without a change record, an event or a new last_updated, as core saves a data source's sync
-        status: a refresh is bookkeeping, and the token is left out of the change data anyway.
+        status: a refresh is bookkeeping, and the token is left out of the change data anyway. The OAuth callback
+        stores the first token the same way.
         """
         notification_source._token = token
         NotificationSource.objects.filter(pk=notification_source.pk).update(_token=token)

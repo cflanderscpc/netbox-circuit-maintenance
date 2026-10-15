@@ -1,27 +1,35 @@
 import datetime
 import itertools
+import json
 from collections import defaultdict
 
+import requests
 from circuits.models import Circuit
 from dcim.models import Cable, CablePath, Device, Interface
 from dcim.utils import compile_path_node, decompile_path_node, object_to_path_node
+from django.contrib import messages
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Avg, Count, F, Max, Min, Q
-from django.shortcuts import render
+from django.shortcuts import redirect, render
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import View
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
+from google_auth_oauthlib.flow import Flow
 from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport, DeleteObject, EditObject
 from netbox.plugins import get_plugin_config
 from netbox.ui import actions, layout
 from netbox.ui.panels import CommentsPanel, JSONPanel, ObjectsTablePanel
 from netbox.views import generic
+from netbox.views.generic.base import BaseObjectView
+from oauthlib.oauth2 import OAuth2Error
 from utilities.permissions import get_permission_for_model
-from utilities.views import ObjectPermissionRequiredMixin, register_model_view
+from utilities.views import GetReturnURLMixin, ObjectPermissionRequiredMixin, get_action_url, register_model_view
 
 from . import filtersets, forms, tables
+from .handle_notifications.sources import GmailAPIOauth, RedirectAuthorize, Source
 from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
+from .object_actions import ValidateSource
 from .ui import panels
 
 #
@@ -277,7 +285,7 @@ class NotificationSourceListView(generic.ObjectListView):
 class NotificationSourceView(generic.ObjectView):
     queryset = NotificationSource.objects.all()
     template_name = 'generic/object.html'
-    actions = (EditObject, DeleteObject)
+    actions = (ValidateSource, EditObject, DeleteObject)
     layout = layout.SimpleLayout(
         left_panels=[
             panels.NotificationSourcePanel(),
@@ -299,6 +307,160 @@ class NotificationSourceEditView(generic.ObjectEditView):
 @register_model_view(NotificationSource, 'delete')
 class NotificationSourceDeleteView(generic.ObjectDeleteView):
     queryset = NotificationSource.objects.all()
+
+
+# The session key of the Google OAuth authorization in progress: the source, and the state and PKCE code verifier that
+# the callback sends on to Google
+GOOGLE_OAUTH_SESSION_KEY = 'netbox_circuit_maintenance_google_oauth'
+
+
+def validate_source(request, notification_source):
+    """
+    Test a source's authentication and report the result as a message. Raises RedirectAuthorize when a Google OAuth
+    source has no usable token.
+    """
+    try:
+        source = Source.init(name=notification_source.name)
+    except ValueError as exc:
+        messages.error(request, _('FAILED: {message}').format(message=exc))
+        return
+    is_authenticated, message = source.test_authentication()
+    if is_authenticated:
+        messages.success(request, _('SUCCESS: {message}').format(message=message))
+    else:
+        messages.error(request, _('FAILED: {message}').format(message=message))
+
+
+def get_google_oauth_flow(request, notification_source, **kwargs):
+    """
+    The Google OAuth web flow that authorizes a GmailAPIOauth source, with the source's client secrets file and scopes.
+    Raises ValueError for any other source. Google sends the user back to the callback's URL, which must be one of the
+    OAuth client's authorized redirect URIs.
+    """
+    source = Source.init(name=notification_source.name)
+    if not isinstance(source, GmailAPIOauth):
+        raise ValueError(f'{notification_source} is not a Google OAuth source.')  # noqa: TRY004 (a configuration error, as in Source.init())
+    flow = Flow.from_client_secrets_file(
+        source.credentials_file,
+        scopes=source.SCOPES + source.extra_scopes,
+        redirect_uri=request.build_absolute_uri(get_action_url(NotificationSource, action='google_oauth2callback')),
+        **kwargs,
+    )
+    # The flow requires it only once it fetches the token, after the user's consent
+    if 'client_secret' not in flow.client_config:
+        raise ValueError(f'Credentials_file {source.credentials_file} for {notification_source} has no client_secret.')
+    return flow
+
+
+@register_model_view(NotificationSource, 'validate')
+class NotificationSourceValidateView(GetReturnURLMixin, BaseObjectView):
+    """
+    Test a source's authentication and report the result as a message. A Google OAuth source without a usable token
+    goes on to its authorization instead, if the user may change the source.
+    """
+
+    queryset = NotificationSource.objects.all()
+
+    def get_required_permission(self):
+        return get_permission_for_model(self.queryset.model, 'view')
+
+    def get(self, request, pk):
+        # Validating can store or discard the source's OAuth token, so it's a POST, like a data source's sync
+        return redirect(self.get_object(pk=pk).get_absolute_url())
+
+    def post(self, request, pk):
+        notification_source = self.get_object(pk=pk)
+        try:
+            validate_source(request, notification_source)
+        except RedirectAuthorize as exc:
+            # Authorizing stores a token on the source, so it needs permission to change the source
+            if request.user.has_perm(get_permission_for_model(NotificationSource, 'change'), notification_source):
+                return redirect(
+                    get_action_url(notification_source, action=exc.url_name, kwargs={'pk': notification_source.pk})
+                )
+            messages.error(
+                request,
+                _('FAILED: {source} needs Google OAuth authorization by a user who can change it.').format(
+                    source=notification_source
+                ),
+            )
+        return redirect(self.get_return_url(request, notification_source))
+
+
+@register_model_view(NotificationSource, 'google_authorize', path='google-authorize')
+class NotificationSourceGoogleAuthorizeView(BaseObjectView):
+    """
+    Start a Google OAuth source's authorization: Google asks the user to let the plugin read the mailbox, then sends
+    them to NotificationSourceGoogleCallbackView.
+    """
+
+    queryset = NotificationSource.objects.all()
+
+    def get_required_permission(self):
+        return get_permission_for_model(self.queryset.model, 'change')
+
+    def get(self, request, pk):
+        notification_source = self.get_object(pk=pk)
+        try:
+            flow = get_google_oauth_flow(request, notification_source)
+        except ValueError as exc:
+            messages.error(request, _('FAILED: {message}').format(message=exc))
+            return redirect(notification_source.get_absolute_url())
+        # Offline access, with consent asked every time, so that Google returns a refresh token even to an OAuth client
+        # the user authorized before
+        authorization_url, state = flow.authorization_url(access_type='offline', prompt='consent')
+        request.session[GOOGLE_OAUTH_SESSION_KEY] = {
+            'source': notification_source.pk,
+            'state': state,
+            'code_verifier': flow.code_verifier,
+        }
+        return redirect(authorization_url)
+
+
+@register_model_view(NotificationSource, 'google_oauth2callback', path='google-oauth2callback', detail=False)
+class NotificationSourceGoogleCallbackView(BaseObjectView):
+    """
+    Complete a Google OAuth source's authorization: exchange the code Google sends back for a token, store the token on
+    the source and validate the source. The URL is the redirect URI registered with Google, so it doesn't name the
+    source; the session does.
+    """
+
+    queryset = NotificationSource.objects.all()
+
+    def get_required_permission(self):
+        return get_permission_for_model(self.queryset.model, 'change')
+
+    def get(self, request):
+        # Each authorization completes once
+        authorization = request.session.pop(GOOGLE_OAUTH_SESSION_KEY, None)
+        if authorization is None:
+            messages.error(request, _('No Google OAuth authorization is in progress.'))
+            return redirect(get_action_url(NotificationSource, action='list'))
+        notification_source = self.get_object(pk=authorization['source'])
+
+        try:
+            flow = get_google_oauth_flow(
+                request, notification_source, state=authorization['state'], code_verifier=authorization['code_verifier']
+            )
+            flow.fetch_token(authorization_response=request.build_absolute_uri())
+        except OAuth2Error as exc:
+            # Reads like google-auth's RefreshError: "access_denied", "invalid_grant: Bad Request"
+            message = f'{exc.error}: {exc.description}' if exc.description else exc.error
+            messages.error(request, _('FAILED: {message}').format(message=message))
+            return redirect(notification_source.get_absolute_url())
+        # oauthlib raises a Warning when Google grants other scopes than the ones requested
+        except (ValueError, Warning, requests.RequestException) as exc:
+            messages.error(request, _('FAILED: {message}').format(message=exc))
+            return redirect(notification_source.get_absolute_url())
+
+        # The source can't load a token without a refresh token, so it keeps the token it has
+        if not flow.credentials.refresh_token:
+            messages.error(request, _('FAILED: Google returned no refresh token.'))
+            return redirect(notification_source.get_absolute_url())
+        GmailAPIOauth.store_token(notification_source, json.loads(flow.credentials.to_json()))
+        # Validate the new token, as Nautobot's callback did by redirecting to Validate
+        validate_source(request, notification_source)
+        return redirect(notification_source.get_absolute_url())
 
 
 #
