@@ -1,5 +1,6 @@
 from importlib import metadata
 
+from django.db.models.signals import post_migrate
 from netbox.plugins import PluginConfig
 
 __version__ = metadata.version(__name__)
@@ -35,6 +36,9 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
 
         # Connect the signal receivers
         from . import signals
+
+        # The NotificationSource sync, for this plugin's post_migrate only
+        post_migrate.connect(signals.import_notification_sources, sender=self)
 
 
 config = NetBoxCircuitMaintenanceConfig

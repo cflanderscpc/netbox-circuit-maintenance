@@ -1,4 +1,6 @@
 import json
+from contextlib import redirect_stderr
+from io import StringIO
 from unittest.mock import patch
 
 from circuit_maintenance_parser import SUPPORTED_PROVIDER_NAMES
@@ -6,9 +8,12 @@ from circuits.models import Provider
 from core.choices import ObjectChangeActionChoices
 from core.events import OBJECT_UPDATED
 from core.models import ObjectChange, ObjectType
+from django.apps import apps
 from django.core import serializers
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
-from django.db import connection
+from django.core.management.sql import emit_post_migrate_signal
+from django.db import DEFAULT_DB_ALIAS, connection
+from django.db.models.signals import post_migrate
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -21,6 +26,8 @@ from utilities.testing import APITestCase, post_data
 from utilities.testing import TestCase as ViewTestCase
 
 from netbox_circuit_maintenance.models import NotificationSource
+
+from .utils import plugin_settings
 
 # These tests don't import netbox_circuit_maintenance.signals: importing it would connect the receivers whether or not
 # PluginConfig.ready() does
@@ -397,3 +404,45 @@ class AddProviderToSourcesAPITestCase(APITestCase):
             if event['object'] == source
         ]
         self.assertEqual(events, [(OBJECT_UPDATED, [], [provider['id'] for provider in response.data])])
+
+
+class ImportNotificationSourcesTestCase(TestCase):
+    # The sync itself is tested with sync_notification_sources() in test_utils
+
+    def test_post_migrate(self):
+        # migrate and flush send post_migrate for every app, and the sync runs for the plugin's, reporting its changes
+        stdout = StringIO()
+        with plugin_settings(notification_sources=[{'name': 'Source 1'}]):
+            emit_post_migrate_signal(1, False, DEFAULT_DB_ALIAS, stdout=stdout)
+        self.assertEqual(list(NotificationSource.objects.values_list('name', flat=True)), ['Source 1'])
+        self.assertEqual(stdout.getvalue(), 'Created notification source Source 1\n')
+
+    def test_post_migrate_verbosity_0(self):
+        stdout = StringIO()
+        with plugin_settings(notification_sources=[{'name': 'Source 1'}]):
+            emit_post_migrate_signal(0, False, DEFAULT_DB_ALIAS, stdout=stdout)
+        self.assertTrue(NotificationSource.objects.exists())
+        self.assertEqual(stdout.getvalue(), '')
+
+    def test_other_app(self):
+        app_config = apps.get_app_config('circuits')
+        with plugin_settings(notification_sources=[{'name': 'Source 1'}]):
+            post_migrate.send(
+                sender=app_config, app_config=app_config, verbosity=0, interactive=False, using=DEFAULT_DB_ALIAS
+            )
+        self.assertFalse(NotificationSource.objects.exists())
+
+    def test_post_migrate_error(self):
+        # A sync that can't run changes nothing and is reported, whatever the verbosity, without failing migrate
+        NotificationSource.objects.create(name='Source 1')
+        stdout = StringIO()
+        with plugin_settings(notification_sources=[{'name': ''}]), redirect_stderr(StringIO()) as stderr:
+            emit_post_migrate_signal(0, False, DEFAULT_DB_ALIAS, stdout=stdout)
+        self.assertEqual(list(NotificationSource.objects.values_list('name', flat=True)), ['Source 1'])
+        self.assertEqual(stdout.getvalue(), '')
+        self.assertEqual(
+            stderr.getvalue(),
+            "The notification sources weren't synced with PLUGINS_CONFIG: notification_sources[0] in PLUGINS_CONFIG "
+            "needs a name of up to 100 characters. Once that's resolved, run migrate or manage.py "
+            'sync_notification_sources.\n',
+        )

@@ -1,3 +1,5 @@
+import sys
+
 from circuit_maintenance_parser import SUPPORTED_PROVIDER_NAMES
 from circuits.models import Provider
 from django.core.exceptions import ValidationError
@@ -8,10 +10,11 @@ from netbox.signals import post_clean
 
 from .constants import PROVIDER_EMAILS_FIELD, PROVIDER_PARSER_FIELD
 from .models import NotificationSource
-from .utils import split_provider_emails
+from .utils import NotificationSourceSyncError, split_provider_emails, sync_notification_sources
 
 __all__ = (
     'add_provider_to_email_sources',
+    'import_notification_sources',
     'validate_provider',
 )
 
@@ -69,3 +72,26 @@ def add_provider_to_email_sources(sender, instance, created, raw=False, **kwargs
         # Record the source's providers before the change, as NetBox does when a signal changes a related object
         source.snapshot()
         source.providers.add(instance)
+
+
+def import_notification_sources(sender, verbosity=1, **kwargs):
+    """
+    Sync the NotificationSources with PLUGINS_CONFIG at the end of each migrate (and flush). PluginConfig.ready()
+    connects it with this plugin as the sender, so it runs once per run. It changes the current models rather than the
+    migration state's, whose deletes would leave a source's bookmarks, subscriptions, journal entries and tags behind.
+    """
+    try:
+        messages = sync_notification_sources()
+    except NotificationSourceSyncError as e:
+        # Report it and let migrate finish: raising would stop upgrade.sh and the later plugins' post_migrate receivers
+        sys.stderr.write(
+            f"The notification sources weren't synced with PLUGINS_CONFIG: {e} Once that's resolved, run migrate or "
+            f'manage.py sync_notification_sources.\n'
+        )
+        return
+
+    # Report changes at the default verbosity: deleting a source also deletes its provider assignments
+    if verbosity >= 1:
+        stdout = kwargs.get('stdout', sys.stdout)
+        for message in messages:
+            stdout.write(f'{message}\n')
