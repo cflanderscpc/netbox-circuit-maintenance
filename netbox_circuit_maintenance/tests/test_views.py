@@ -822,6 +822,42 @@ class NotificationSourceTestCase(
                 f'Failed to initialize source: File {paths["installed"]} doesn&#x27;t contain any supported credentials.',
             )
 
+    def test_get_object_configuration_graph(self):
+        source = NotificationSource.objects.get(name='Source 1')
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        config = {
+            'name': 'Source 1',
+            'url': 'https://graph.microsoft.com',
+            'account': 'noc@example.com',
+            'tenant_id': 'contoso.onmicrosoft.com',
+            'client_id': 'client-id',
+            'secret': 'client-secret-value',
+        }
+
+        with (
+            plugin_settings(notification_sources=[config]),
+            self.assertNoLogs('netbox_circuit_maintenance'),
+        ):
+            response = self.client.get(source.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, '<th scope="row">Type</th><td>MicrosoftGraph</td>', html=True)
+        self.assertContains(response, '<th scope="row">Account ID</th><td>noc@example.com</td>', html=True)
+        self.assertNotContains(response, 'Authentication status')
+        self.assertNotContains(response, 'client-secret-value')
+
+        # A malformed credential is reported on the page, without the secret
+        with (
+            plugin_settings(notification_sources=[{**config, 'tenant_id': 'contoso tenant'}]),
+            self.assertLogs('netbox_circuit_maintenance.ui.panels', 'WARNING'),
+        ):
+            response = self.client.get(source.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(
+            response,
+            'Failed to initialize source: 1 validation error for MicrosoftGraph<br>  Value error, Invalid tenant',
+        )
+        self.assertNotContains(response, 'client-secret-value')
+
     # The form only offers providers the user can view
     @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_edit_object_configured_fields(self):

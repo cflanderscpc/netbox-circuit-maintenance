@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import email
 import json
 import os
@@ -9,7 +10,13 @@ from datetime import UTC, datetime
 from email.message import EmailMessage
 from functools import cache
 from unittest.mock import ANY, MagicMock, patch
+from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 
+import httpx
+from azure.core.credentials import AccessToken
+from azure.core.exceptions import ClientAuthenticationError
+from azure.identity.aio import ClientSecretCredential
 from circuits.models import Provider
 from core.models import ObjectChange
 from cryptography.hazmat.primitives import serialization
@@ -23,6 +30,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 from httplib2 import Response
+from kiota_http.kiota_client_factory import KiotaClientFactory
+from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 from netbox.context_managers import event_tracking
 from pydantic import ValidationError
 from users.models import User
@@ -36,6 +45,7 @@ from netbox_circuit_maintenance.handle_notifications.sources import (
     GmailAPIOauth,
     GmailAPIServiceAccount,
     MaintenanceNotification,
+    MicrosoftGraph,
     RedirectAuthorize,
     Source,
     get_notifications,
@@ -64,6 +74,15 @@ SOURCE_GMAIL_API_OAUTH = {
     'name': 'source gmail api oauth',
     'account': 'me@example.com',
     'url': 'https://accounts.google.com/o/oauth2/auth',
+}
+
+SOURCE_MICROSOFT_GRAPH = {
+    'name': 'source microsoft graph',
+    'account': 'me@example.com',
+    'url': 'https://graph.microsoft.com',
+    'tenant_id': 'contoso.onmicrosoft.com',
+    'client_id': 'client-id',
+    'secret': 'supersecret',
 }
 
 # Noon UTC, so the date is 1 February 2021 from UTC-11 to UTC+11
@@ -181,6 +200,89 @@ class GmailSourcesMixin:
         cls.enterClassContext(plugin_settings(notification_sources=[cls.config_service_account, cls.config_oauth]))
 
 
+def graph_source(**kwargs):
+    return MicrosoftGraph(
+        name='whatever',
+        url='https://graph.microsoft.com',
+        account='me@example.com',
+        tenant_id='contoso.onmicrosoft.com',
+        client_id='client-id',
+        client_secret='client-secret',
+        **kwargs,
+    )
+
+
+def graph_error(status, code, message, headers=None):
+    """
+    An error response from Microsoft Graph.
+    """
+    return status, {'error': {'code': code, 'message': message}}, headers or {}
+
+
+# The path of the account's mailbox in Microsoft Graph's v1.0 API
+GRAPH_MAILBOX = '/v1.0/users/me@example.com'
+
+
+class FakeGraph:
+    """
+    Stands in for Microsoft Graph, below msgraph-sdk and kiota's middleware: an httpx transport answers each request
+    from `responses`, keyed by its decoded path and query, and records it. A list holds the responses to successive
+    requests, and any other request gets Graph's 404. Getting a token from Microsoft Entra ID is mocked too.
+
+    Each response is a status and a JSON body or bytes, and optionally headers.
+    """
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.requests = []
+        self.raw_paths = []
+        self.clients = []
+
+    def handle(self, request):
+        url = unquote(request.url.raw_path.decode())
+        self.requests.append((request.method, url, request.headers['Authorization']))
+        self.raw_paths.append(request.url.raw_path.decode())
+        response = self.responses.get(url, graph_error(404, 'ErrorItemNotFound', 'The specified object was not found.'))
+        if isinstance(response, list):
+            response = response.pop(0)
+        status, body, *headers = response
+        if isinstance(body, bytes):
+            return httpx.Response(status, content=body, headers=headers[0] if headers else None)
+        return httpx.Response(status, json=body, headers=headers[0] if headers else None)
+
+    def get_default_client(self):
+        # The HTTP client that kiota creates, and wraps in its middleware, with this fake instead of the network
+        self.clients.append(httpx.AsyncClient(transport=httpx.MockTransport(self.handle)))
+        return self.clients[-1]
+
+    def __enter__(self):
+        self.stack = contextlib.ExitStack()
+        self.stack.enter_context(
+            patch.object(KiotaClientFactory, 'get_default_client', side_effect=self.get_default_client)
+        )
+        self.credential = self.stack.enter_context(
+            patch(f'{SOURCES_MODULE}.ClientSecretCredential', wraps=ClientSecretCredential)
+        )
+        self.get_token = self.stack.enter_context(
+            patch.object(
+                ClientSecretCredential, 'get_token', autospec=True, return_value=AccessToken('access-token', 2**32)
+            )
+        )
+        self.close = self.stack.enter_context(
+            patch.object(ClientSecretCredential, 'close', autospec=True, side_effect=ClientSecretCredential.close)
+        )
+        return self
+
+    def __exit__(self, *exc_info):
+        return self.stack.__exit__(*exc_info)
+
+    def closed(self):
+        """
+        Return whether each HTTP client was closed, and how many times a credential was.
+        """
+        return [client.is_closed for client in self.clients], self.close.await_count
+
+
 class SourceTestCase(TestCase):
     def test_source_factory_nonexistent_name(self):
         # Without any configured source (the default setting)
@@ -196,18 +298,21 @@ class SourceTestCase(TestCase):
             Source.init(name=SOURCE_IMAP['name'])
 
     def test_source_factory_url_scheme_not_supported(self):
-        # EWS is replaced by Microsoft Graph, and isn't coming back; HTTPS is only for Gmail
+        # EWS is replaced by Microsoft Graph, and isn't coming back; HTTPS is only for Gmail and Microsoft Graph's
+        # global service
         for url, scheme in (
             ('ftp://example.com', 'ftp'),
             ('ews://example.com', 'ews'),
             ('https://example.com/o/oauth2/auth', 'https'),
+            ('https://graph.microsoft.us', 'https'),
         ):
             with (
                 self.subTest(url=url),
                 plugin_settings(notification_sources=[{**SOURCE_IMAP, 'url': url}]),
                 self.assertRaisesMessage(
                     ValueError,
-                    f'Scheme {scheme} not supported as Notification Source (only IMAP or HTTPS to accounts.google.com).',
+                    f'Scheme {scheme} not supported as Notification Source '
+                    '(only IMAP or HTTPS to accounts.google.com or graph.microsoft.com).',
                 ),
             ):
                 Source.init(name=SOURCE_IMAP['name'])
@@ -216,7 +321,9 @@ class SourceTestCase(TestCase):
         with (
             plugin_settings(notification_sources=[{**SOURCE_IMAP, 'url': 'wrong url'}]),
             self.assertRaisesMessage(
-                ValueError, 'Scheme  not supported as Notification Source (only IMAP or HTTPS to accounts.google.com).'
+                ValueError,
+                'Scheme  not supported as Notification Source '
+                '(only IMAP or HTTPS to accounts.google.com or graph.microsoft.com).',
             ),
         ):
             Source.init(name=SOURCE_IMAP['name'])
@@ -256,6 +363,14 @@ class EmailSourceTestCase(TestCase):
             ('<user@example.com>', 'user@example.com'),
             ('user <user@example.com>', 'user@example.com'),
             ('No-reply via mailing list <mailing-list@example.com>', 'mailing-list@example.com'),
+            ('"Doe, John" <John.Doe@Example.com>', 'john.doe@example.com'),
+            ('noc@example.com (NOC)', 'noc@example.com'),
+            # Every RFC 5322 address character (Nautobot's pattern cut these at the first "+" or "'")
+            ('noc+maintenance@example.com', 'noc+maintenance@example.com'),
+            ('NOC <noc+maintenance@example.com>', 'noc+maintenance@example.com'),
+            ("o'brien@example.com", "o'brien@example.com"),
+            ("a!#$%&'*+/=?^_`{|}~-z@example.com", "a!#$%&'*+/=?^_`{|}~-z@example.com"),
+            ('', ''),
         ):
             with self.subTest(email_source=email_source):
                 self.assertEqual(EmailSource.extract_email_source(email_source), email_source_output)
@@ -1572,3 +1687,353 @@ class GmailAPIServiceAccountTestCase(GmailSourcesMixin, TestCase):
         self.assertFalse(is_authenticated)
         self.assertTrue(message.startswith('Service account info was not in the expected format, missing fields '))
         self.assertIn('client_email', message)
+
+
+# Nautobot's TestExchangeWebService covered the EWS source that this one replaces
+@plugin_settings(notification_sources=[SOURCE_MICROSOFT_GRAPH])
+class MicrosoftGraphTestCase(TestCase):
+    INBOX = f'{GRAPH_MAILBOX}/mailFolders/inbox?$select=id'
+    FOLDER = f"{GRAPH_MAILBOX}/mailFolders/inbox/childFolders?$filter=displayName eq 'Circuit Notifications'&$select=id"
+    MESSAGES = f'{GRAPH_MAILBOX}/mailFolders/folder-id/messages'
+    # The SINCE that get_notifications() is given, less the day it adds
+    RECEIVED = 'receivedDateTime ge 2021-01-31T12:00:00Z'
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.provider = Provider.objects.create(
+            name='ntt', slug='ntt', custom_field_data={PROVIDER_EMAILS_FIELD: 'sender@example.com'}
+        )
+        cls.notification_source = NotificationSource.objects.create(name=SOURCE_MICROSOFT_GRAPH['name'])
+        cls.notification_source.providers.add(cls.provider)
+
+    def test_source_factory(self):
+        source = Source.init(name=SOURCE_MICROSOFT_GRAPH['name'])
+        self.assertIsInstance(source, MicrosoftGraph)
+        self.assertEqual(
+            (source.name, source.url, source.account, source.tenant_id, source.client_id, source.client_secret),
+            (
+                SOURCE_MICROSOFT_GRAPH['name'],
+                'https://graph.microsoft.com',
+                'me@example.com',
+                'contoso.onmicrosoft.com',
+                'client-id',
+                'supersecret',
+            ),
+        )
+        self.assertEqual((source.folder, source.source_header, source.dry_run), (None, 'From', False))
+        self.assertEqual(source.get_account_id(), 'me@example.com')
+        self.assertNotIn('supersecret', repr(source))
+        self.assertIn('client-id', repr(source))
+
+    def test_source_factory_options(self):
+        with plugin_settings(notification_sources=[{**SOURCE_MICROSOFT_GRAPH, 'folder': 'Circuit Notifications'}]):
+            source = Source.init(name=SOURCE_MICROSOFT_GRAPH['name'], dry_run=True)
+        self.assertEqual((source.folder, source.dry_run), ('Circuit Notifications', True))
+
+    def test_source_factory_url(self):
+        # The host is compared as a hostname, as for Gmail; the path doesn't matter
+        for url in (
+            'https://GRAPH.microsoft.com',
+            'https://graph.microsoft.com:443/v1.0',
+            'HTTPS://graph.microsoft.com/',
+        ):
+            with (
+                self.subTest(url=url),
+                plugin_settings(notification_sources=[{**SOURCE_MICROSOFT_GRAPH, 'url': url}]),
+            ):
+                self.assertIsInstance(Source.init(name=SOURCE_MICROSOFT_GRAPH['name']), MicrosoftGraph)
+
+    def test_source_factory_missing_keys(self):
+        for key, field in (
+            ('account', 'account'),
+            ('tenant_id', 'tenant_id'),
+            ('client_id', 'client_id'),
+            ('secret', 'client_secret'),
+        ):
+            with (
+                self.subTest(key=key),
+                plugin_settings(notification_sources=[without(SOURCE_MICROSOFT_GRAPH, key)]),
+                self.assertRaisesMessage(ValidationError, f'{field}\n  Input should be a valid string'),
+            ):
+                Source.init(name=SOURCE_MICROSOFT_GRAPH['name'])
+
+    def test_source_factory_invalid_values(self):
+        # azure-identity checks the values when a run creates the credential. The init checks them first, so the source
+        # is skipped rather than failing the run
+        for key, value, message in (
+            ('tenant_id', 'contoso tenant', 'Value error, Invalid tenant ID provided.'),
+            ('client_id', '', 'Value error, client_id should be the id of a Microsoft Entra application'),
+            ('secret', '', "Value error, secret should be a Microsoft Entra application's client secret"),
+        ):
+            with (
+                self.subTest(key=key),
+                plugin_settings(notification_sources=[{**SOURCE_MICROSOFT_GRAPH, key: value}]),
+                self.assertRaises(ValidationError) as context,
+            ):
+                Source.init(name=SOURCE_MICROSOFT_GRAPH['name'])
+            self.assertIn(message, str(context.exception))
+            # The error leaves out the input, the secret included
+            self.assertNotIn('supersecret', str(context.exception))
+
+    def test_source_factory_not_installed(self):
+        with (
+            patch(f'{SOURCES_MODULE}.MSGRAPH_PRESENT', False),
+            self.assertRaisesMessage(
+                ValueError,
+                "You must install 'msgraph-sdk' (the plugin's m365 extra) to use HTTPS to graph.microsoft.com.",
+            ),
+        ):
+            Source.init(name=SOURCE_MICROSOFT_GRAPH['name'])
+
+    def test_get_notifications_invalid_source(self):
+        job = MockedJob()
+        with (
+            plugin_settings(notification_sources=[{**SOURCE_MICROSOFT_GRAPH, 'tenant_id': 'contoso tenant'}]),
+            FakeGraph({}) as graph,
+        ):
+            self.assertEqual(get_notifications(job, NotificationSource.objects.all(), SINCE), [])
+        assert_called_with_substring(
+            job.logger.warning,
+            f'Notification Source {SOURCE_MICROSOFT_GRAPH["name"]} is not matching class expectations: '
+            '1 validation error for MicrosoftGraph\n  Value error, Invalid tenant ID provided.',
+        )
+        self.assertEqual(graph.requests, [])
+
+    def test_test_authentication(self):
+        source = Source.init(name=SOURCE_MICROSOFT_GRAPH['name'])
+
+        with FakeGraph({self.INBOX: (200, {'id': 'inbox-id'})}) as graph:
+            self.assertEqual(source.test_authentication(), (True, 'Test OK'))
+        # The app signs in with the source's credentials, for Microsoft Graph
+        graph.credential.assert_called_once_with('contoso.onmicrosoft.com', 'client-id', 'supersecret')
+        self.assertEqual(graph.get_token.call_args.args[1:], ('https://graph.microsoft.com/.default',))
+        # Reading the Inbox checks the app's access to the mailbox
+        self.assertEqual(graph.requests, [('GET', self.INBOX, 'Bearer access-token')])
+        self.assertEqual(graph.closed(), ([True], 1))
+
+    def test_test_authentication_folder(self):
+        source = graph_source(folder="Bob's notices")
+        folder = f"{GRAPH_MAILBOX}/mailFolders/inbox/childFolders?$filter=displayName eq 'Bob''s notices'&$select=id"
+
+        with FakeGraph({folder: (200, {'value': [{'id': 'folder-id'}]})}) as graph:
+            self.assertEqual(source.test_authentication(), (True, 'Test OK'))
+        self.assertEqual(graph.requests, [('GET', folder, 'Bearer access-token')])
+
+        with FakeGraph({folder: (200, {'value': []})}):
+            self.assertEqual(
+                source.test_authentication(), (False, "Folder Bob's notices not found in the Inbox of me@example.com.")
+            )
+
+    def test_test_authentication_ko(self):
+        source = graph_source()
+
+        # The app isn't allowed to read the mailbox
+        with FakeGraph(
+            {self.INBOX: graph_error(403, 'ErrorAccessDenied', 'Access is denied. Check credentials and try again.')}
+        ) as graph:
+            self.assertEqual(
+                source.test_authentication(), (False, 'Access is denied. Check credentials and try again. (status 403)')
+            )
+        self.assertEqual(graph.closed(), ([True], 1))
+
+        # Microsoft Entra ID refuses the credentials
+        error = ClientAuthenticationError(
+            'ClientSecretCredential.get_token failed: AADSTS7000215: Invalid client secret'
+        )
+        with FakeGraph({self.INBOX: (200, {'id': 'inbox-id'})}) as graph:
+            graph.get_token.side_effect = error
+            self.assertEqual(source.test_authentication(), (False, str(error)))
+        self.assertEqual(graph.requests, [])
+
+    def test_get_filters(self):
+        for since_timestamp, emails_to_fetch, filters in (
+            (None, [], [None]),
+            # In UTC, whatever the time zone of the time given
+            (
+                datetime(2021, 1, 31, 5, tzinfo=ZoneInfo('America/Edmonton')),
+                [],
+                ['receivedDateTime ge 2021-01-31T12:00:00Z'],
+            ),
+            # One search per sender, as IMAP searches; quotes in an address are doubled
+            (
+                None,
+                ['a@example.com', "o'brien@example.com"],
+                ["from/emailAddress/address eq 'a@example.com'", "from/emailAddress/address eq 'o''brien@example.com'"],
+            ),
+            (
+                datetime(2021, 1, 31, 12, tzinfo=UTC),
+                ['a@example.com'],
+                ["receivedDateTime ge 2021-01-31T12:00:00Z and from/emailAddress/address eq 'a@example.com'"],
+            ),
+        ):
+            with self.subTest(since_timestamp=since_timestamp, emails_to_fetch=emails_to_fetch):
+                source = graph_source(emails_to_fetch=emails_to_fetch)
+                self.assertEqual(source._get_filters(since_timestamp), filters)
+
+    def test_receive_notifications(self):
+        sender_messages = (
+            f"{self.MESSAGES}?$filter={self.RECEIVED} and from/emailAddress/address eq 'sender@example.com'"
+        )
+        noc_messages = f"{self.MESSAGES}?$filter={self.RECEIVED} and from/emailAddress/address eq 'noc@example.net'"
+        contents = {
+            'msg-1': raw_email(subject='Maintenance 1'),
+            # Skipped, and the run goes on
+            'msg-2': b'From: sender@example.com\r\nSubject: No date\r\n\r\nbody',
+            'msg-3': raw_email(sender='Sender <SENDER@example.com>', subject='=?utf-8?q?Maintenance_3?='),
+        }
+        responses = {
+            self.FOLDER: (200, {'value': [{'id': 'folder-id'}]}),
+            # The list comes in pages
+            f'{sender_messages}&$select=id&$top=100': (
+                200,
+                {
+                    'value': [{'id': 'msg-1'}, {'id': 'msg-2'}],
+                    '@odata.nextLink': f'https://graph.microsoft.com{self.MESSAGES}?$skiptoken=page-2',
+                },
+            ),
+            f'{self.MESSAGES}?$skiptoken=page-2': (200, {'value': [{'id': 'msg-3'}]}),
+            f'{noc_messages}&$select=id&$top=100': (200, {'value': []}),
+            **{f'{GRAPH_MAILBOX}/messages/{msg_id}/$value': (200, content) for msg_id, content in contents.items()},
+        }
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                source = graph_source(
+                    folder='Circuit Notifications',
+                    dry_run=dry_run,
+                    emails_to_fetch=['sender@example.com', 'noc@example.net'],
+                )
+                job = MockedJob()
+
+                with FakeGraph(responses) as graph:
+                    notifications = source.receive_notifications(job, datetime(2021, 1, 31, 12, tzinfo=UTC))
+
+                # Read only, whether it's a dry run or not: nothing is tagged or marked as read
+                self.assertEqual(
+                    [(method, url) for method, url, _ in graph.requests],
+                    [
+                        ('GET', self.FOLDER),
+                        ('GET', f'{sender_messages}&$select=id&$top=100'),
+                        ('GET', f'{self.MESSAGES}?$skiptoken=page-2'),
+                        ('GET', f'{GRAPH_MAILBOX}/messages/msg-1/$value'),
+                        ('GET', f'{GRAPH_MAILBOX}/messages/msg-2/$value'),
+                        ('GET', f'{GRAPH_MAILBOX}/messages/msg-3/$value'),
+                        ('GET', f'{noc_messages}&$select=id&$top=100'),
+                    ],
+                )
+                # One client and one credential for the run, both closed at its end
+                self.assertEqual(graph.closed(), ([True], 1))
+
+                # The MIME content is processed as IMAP and Gmail process their emails
+                self.assertEqual([n.msg_id for n in notifications], [b'msg-1', b'msg-3'])
+                self.assertEqual([n.subject for n in notifications], ['Maintenance 1', 'Maintenance 3'])
+                self.assertEqual({(n.sender, n.provider_type) for n in notifications}, {('sender@example.com', 'ntt')})
+                self.assertEqual(notifications[0].date, 'Mon, 1 Feb 2021 09:33:34 +0000')
+                self.assertEqual(notifications[0].raw_payload, email.message_from_bytes(contents['msg-1']).as_bytes())
+                self.assertIs(notifications[0].source, source)
+                job.logger.error.assert_called_once_with(
+                    'Skipping the email from sender@example.com because it has no Date header.', extra=ANY
+                )
+                self.assertEqual(
+                    [debug.args for debug in job.logger.debug.call_args_list],
+                    [
+                        (f'Fetched 3 emails from whatever source using filter: {sender_messages.split("=", 1)[1]}.',),
+                        (f'Fetched 0 emails from whatever source using filter: {noc_messages.split("=", 1)[1]}.',),
+                        ('Raw notifications created 2 from whatever.',),
+                    ],
+                )
+
+    def test_receive_notifications_inbox(self):
+        # Without a folder, sender or time, every message in the Inbox
+        responses = {
+            self.INBOX: (200, {'id': 'inbox-id'}),
+            f'{GRAPH_MAILBOX}/mailFolders/inbox-id/messages?$select=id&$top=100': (200, {'value': [{'id': 'msg-1'}]}),
+            f'{GRAPH_MAILBOX}/messages/msg-1/$value': (200, raw_email()),
+        }
+        with FakeGraph(responses) as graph:
+            notifications = graph_source().receive_notifications(MockedJob())
+        self.assertEqual([n.msg_id for n in notifications], [b'msg-1'])
+        self.assertEqual([url for _, url, _ in graph.requests], list(responses))
+
+    @patch('kiota_http.middleware.retry_handler.asyncio.sleep')
+    def test_receive_notifications_throttled(self, sleep):
+        # kiota's middleware retries a throttled request after the time Graph asks for
+        responses = {
+            self.INBOX: (200, {'id': 'inbox-id'}),
+            f'{GRAPH_MAILBOX}/mailFolders/inbox-id/messages?$select=id&$top=100': [
+                graph_error(
+                    429, 'TooManyRequests', 'Application is over its MailboxConcurrency limit.', {'Retry-After': '2'}
+                ),
+                (200, {'value': []}),
+            ],
+        }
+        with FakeGraph(responses) as graph:
+            self.assertEqual(graph_source().receive_notifications(MockedJob()), [])
+        self.assertEqual(len(graph.requests), 3)
+        sleep.assert_awaited_once_with(2)
+
+    def test_get_notifications(self):
+        job = MockedJob()
+        responses = {
+            self.INBOX: (200, {'id': 'inbox-id'}),
+            f'{GRAPH_MAILBOX}/mailFolders/inbox-id/messages?$filter={self.RECEIVED} and '
+            "from/emailAddress/address eq 'sender@example.com'&$select=id&$top=100": (
+                200,
+                {'value': [{'id': 'msg-1'}]},
+            ),
+            f'{GRAPH_MAILBOX}/messages/msg-1/$value': (200, raw_email()),
+        }
+        with FakeGraph(responses) as graph:
+            notifications = get_notifications(job, NotificationSource.objects.all(), SINCE)
+
+        self.assertEqual([url for _, url, _ in graph.requests], list(responses))
+        self.assertEqual([(n.msg_id, n.provider_type) for n in notifications], [(b'msg-1', 'ntt')])
+        self.assertEqual(notifications[0].source.name, SOURCE_MICROSOFT_GRAPH['name'])
+        job.logger.warning.assert_not_called()
+
+    def test_get_notifications_address_characters(self):
+        # Addresses with any RFC 5322 character are searched for and matched to their provider, as EWS's parsed
+        # sender was (Nautobot's pattern read "noc+maint@example.com" as "noc")
+        provider = Provider.objects.create(
+            name='zayo',
+            slug='zayo',
+            custom_field_data={PROVIDER_EMAILS_FIELD: "noc+maint@example.com, o'brien@example.com"},
+        )
+        self.notification_source.providers.set([provider])
+        messages = (
+            f'{GRAPH_MAILBOX}/mailFolders/inbox-id/messages?$filter={self.RECEIVED} and from/emailAddress/address eq'
+        )
+        responses = {
+            self.INBOX: (200, {'id': 'inbox-id'}),
+            f"{messages} 'noc+maint@example.com'&$select=id&$top=100": (200, {'value': [{'id': 'msg-1'}]}),
+            f"{messages} 'o''brien@example.com'&$select=id&$top=100": (200, {'value': [{'id': 'msg-2'}]}),
+            f'{GRAPH_MAILBOX}/messages/msg-1/$value': (200, raw_email(sender='NOC <NOC+maint@example.com>')),
+            f'{GRAPH_MAILBOX}/messages/msg-2/$value': (200, raw_email(sender="o'brien@example.com")),
+        }
+        job = MockedJob()
+        with FakeGraph(responses) as graph:
+            notifications = get_notifications(job, NotificationSource.objects.all(), SINCE)
+
+        self.assertEqual(
+            [(n.sender, n.provider_type) for n in notifications],
+            [('noc+maint@example.com', 'zayo'), ("o'brien@example.com", 'zayo')],
+        )
+        job.logger.warning.assert_not_called()
+        # The + is sent encoded, so Graph can't read it as a space
+        self.assertIn('%27noc%2Bmaint%40example.com%27', graph.raw_paths[1])
+
+    def test_get_notifications_error(self):
+        # A failure stops the run, as other sources' failures do
+        job = MockedJob()
+        responses = {
+            self.INBOX: graph_error(403, 'ErrorAccessDenied', 'Access is denied. Check credentials and try again.'),
+        }
+        with (
+            FakeGraph(responses) as graph,
+            self.assertRaisesMessage(ODataError, 'Access is denied. Check credentials and try again. (status 403)'),
+        ):
+            get_notifications(job, NotificationSource.objects.all(), SINCE)
+        job.logger.exception.assert_called_once_with(
+            f'Issue fetching notifications from {SOURCE_MICROSOFT_GRAPH["name"]}',
+            extra={'object': self.notification_source},
+        )
+        self.assertEqual(graph.closed(), ([True], 1))

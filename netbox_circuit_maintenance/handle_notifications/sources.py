@@ -1,4 +1,6 @@
+import asyncio
 import base64
+import contextlib
 import datetime
 import email
 import email.policy
@@ -12,6 +14,7 @@ import time
 from collections.abc import Iterable
 from email.message import Message
 from email.parser import BytesHeaderParser
+from typing import ClassVar
 from urllib.parse import urlparse
 
 from circuits.models import Provider
@@ -24,12 +27,31 @@ from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 from netbox.jobs import JobRunner
 from netbox.plugins import get_plugin_config
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ..constants import PROVIDER_EMAILS_FIELD
 from ..enum import MessageProcessingStatus
 from ..models import NotificationSource
 from ..utils import split_provider_emails
+
+# msgraph-sdk comes with the plugin's m365 extra
+try:
+    from azure.identity.aio import ClientSecretCredential
+    from kiota_abstractions.base_request_configuration import RequestConfiguration
+    from kiota_authentication_azure.azure_identity_authentication_provider import AzureIdentityAuthenticationProvider
+    from kiota_http.kiota_client_factory import KiotaClientFactory
+    from msgraph import GraphRequestAdapter, GraphServiceClient
+    from msgraph.generated.users.item.mail_folders.item.child_folders.child_folders_request_builder import (
+        ChildFoldersRequestBuilder,
+    )
+    from msgraph.generated.users.item.mail_folders.item.mail_folder_item_request_builder import (
+        MailFolderItemRequestBuilder,
+    )
+    from msgraph.generated.users.item.mail_folders.item.messages.messages_request_builder import MessagesRequestBuilder
+
+    MSGRAPH_PRESENT = True
+except ImportError:
+    MSGRAPH_PRESENT = False
 
 __all__ = (
     'IMAP',
@@ -38,12 +60,17 @@ __all__ = (
     'GmailAPIOauth',
     'GmailAPIServiceAccount',
     'MaintenanceNotification',
+    'MicrosoftGraph',
     'RedirectAuthorize',
     'Source',
     'get_notifications',
 )
 
 logger = logging.getLogger(__name__)
+
+# An email address's characters: RFC 5322 atext, dots and the @. Nautobot allowed only letters, digits, "-", "_", "."
+# and "@", so it cut "noc+maint@x.com" down to "noc"
+EMAIL_ADDRESS_PATTERN = r"[-A-Za-z0-9!#$%&'*+/=?^_`{|}~.@]+"
 
 
 class Source(BaseModel):
@@ -161,6 +188,21 @@ class Source(BaseModel):
                 imap_port=url_components.port or 993,
                 source_header=config.get('source_header', 'From'),
             )
+        if scheme == 'https' and url_components.hostname == 'graph.microsoft.com':
+            if not MSGRAPH_PRESENT:
+                raise ValueError(
+                    "You must install 'msgraph-sdk' (the plugin's m365 extra) to use HTTPS to graph.microsoft.com."
+                )
+            return MicrosoftGraph(
+                name=name,
+                url=url,
+                dry_run=dry_run,
+                account=config.get('account'),
+                tenant_id=config.get('tenant_id'),
+                client_id=config.get('client_id'),
+                client_secret=config.get('secret'),
+                folder=config.get('folder'),
+            )
         if scheme == 'https' and url_components.hostname == 'accounts.google.com':
             creds_filename = config.get('credentials_file')
             if not creds_filename:
@@ -197,7 +239,8 @@ class Source(BaseModel):
             )
 
         raise ValueError(
-            f'Scheme {scheme} not supported as Notification Source (only IMAP or HTTPS to accounts.google.com).'
+            f'Scheme {scheme} not supported as Notification Source '
+            '(only IMAP or HTTPS to accounts.google.com or graph.microsoft.com).'
         )
 
     def tag_message(self, job: JobRunner, msg_id: str | bytes, tag: MessageProcessingStatus):
@@ -300,10 +343,10 @@ class EmailSource(Source):
         Method to get the sender email address.
         """
         try:
-            email_source = re.search(r'\<([-A-Za-z0-9_@.]+)\>', email_source).group(1)
+            email_source = re.search(rf'\<({EMAIL_ADDRESS_PATTERN})\>', email_source).group(1)
         except AttributeError:
             try:
-                email_source = re.search(r'([-A-Za-z0-9_@.]+)', email_source).group(1)
+                email_source = re.search(f'({EMAIL_ADDRESS_PATTERN})', email_source).group(1)
             except AttributeError:
                 return ''
         return email_source.lower()
@@ -487,6 +530,139 @@ class IMAP(EmailSource):
         job.logger.debug(f'Raw notifications created {len(received_notifications)} from {self.name}.')
 
         self.close_session()
+        return received_notifications
+
+
+class MicrosoftGraph(EmailSource):
+    """
+    Microsoft Graph class, extending Source class, for an Exchange Online mailbox. It replaces Nautobot's Exchange Web
+    Services source.
+
+    The source signs in as an application (OAuth client credentials) with the Mail.Read application permission, so it
+    reads messages, and neither tags them nor marks them as read. msgraph-sdk is async only: each method runs its
+    requests in an event loop of its own, and uses the ORM, which refuses to run inside one, outside it.
+    """
+
+    tenant_id: str
+    client_id: str
+    client_secret: str = Field(..., repr=False)
+    # A sub-folder of the Inbox, by name, as in Nautobot's EWS source
+    folder: str | None = None
+
+    # Client credentials ask for every application permission granted to the app registration
+    SCOPES: ClassVar[list[str]] = ['https://graph.microsoft.com/.default']
+
+    @model_validator(mode='after')
+    def check_credential(self):
+        """
+        Check the credential's values as azure-identity does when a run creates the credential, so that a malformed
+        one is a source that can't be set up, which the callers skip, rather than a failed run.
+        """
+        ClientSecretCredential(self.tenant_id, self.client_id, self.client_secret)
+        return self
+
+    @staticmethod
+    def _quote(value: str) -> str:
+        """
+        Return the value as an OData string literal.
+        """
+        return "'" + value.replace("'", "''") + "'"
+
+    @contextlib.asynccontextmanager
+    async def _mailbox(self):
+        """
+        Yield the account's mailbox, through a Graph client that is closed on exit.
+        """
+        # kiota's HTTP client rather than msgraph-core's, whose middleware (retries when throttled among it) doesn't run
+        # with the kiota-http it allows
+        async with (
+            ClientSecretCredential(self.tenant_id, self.client_id, self.client_secret) as credential,
+            KiotaClientFactory.create_with_default_middleware() as http_client,
+        ):
+            auth_provider = AzureIdentityAuthenticationProvider(credential, scopes=self.SCOPES)
+            client = GraphServiceClient(request_adapter=GraphRequestAdapter(auth_provider, client=http_client))
+            yield client.users.by_user_id(self.account)
+
+    async def _get_folder_id(self, mailbox) -> str:
+        """
+        Return the ID of the Inbox, or of its sub-folder named `folder`.
+        """
+        inbox = mailbox.mail_folders.by_mail_folder_id('inbox')
+        if not self.folder:
+            query = MailFolderItemRequestBuilder.MailFolderItemRequestBuilderGetQueryParameters(select=['id'])
+            return (await inbox.get(RequestConfiguration(query_parameters=query))).id
+
+        query = ChildFoldersRequestBuilder.ChildFoldersRequestBuilderGetQueryParameters(
+            filter=f'displayName eq {self._quote(self.folder)}', select=['id']
+        )
+        folders = await inbox.child_folders.get(RequestConfiguration(query_parameters=query))
+        if not folders.value:
+            raise ValueError(f'Folder {self.folder} not found in the Inbox of {self.account}.')
+        return folders.value[0].id
+
+    def _authentication_logic(self):
+        """
+        Inner method to run the custom class validation logic. Finding the folder checks the credentials, the
+        application's access to the mailbox and the folder's name.
+        """
+
+        async def find_folder():
+            async with self._mailbox() as mailbox:
+                await self._get_folder_id(mailbox)
+
+        asyncio.run(find_folder())
+
+    def _get_filters(self, since_timestamp: datetime.datetime | None = None) -> list[str | None]:
+        """
+        Build the $filter of each message search: one per sender, as IMAP searches, and by received time if provided.
+        """
+        received = None
+        if since_timestamp:
+            received = f'receivedDateTime ge {since_timestamp.astimezone(datetime.UTC):%Y-%m-%dT%H:%M:%SZ}'
+        if not self.emails_to_fetch:
+            return [received]
+        return [
+            ' and '.join(filter(None, (received, f'from/emailAddress/address eq {self._quote(sender)}')))
+            for sender in self.emails_to_fetch
+        ]
+
+    async def _fetch_emails(self, filters: list[str | None]) -> list[tuple[str | None, list[tuple[str, bytes]]]]:
+        """
+        Run each search in the folder, and fetch the messages it finds: their ID and MIME content, per search.
+        """
+        searches = []
+        async with self._mailbox() as mailbox:
+            messages = mailbox.mail_folders.by_mail_folder_id(await self._get_folder_id(mailbox)).messages
+            for search_filter in filters:
+                query = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+                    filter=search_filter, select=['id'], top=100
+                )
+                page = await messages.get(RequestConfiguration(query_parameters=query))
+                msg_ids = [message.id for message in page.value]
+                while page.odata_next_link:
+                    page = await messages.with_url(page.odata_next_link).get()
+                    msg_ids.extend(message.id for message in page.value)
+                emails = [(msg_id, await mailbox.messages.by_message_id(msg_id).content.get()) for msg_id in msg_ids]
+                searches.append((search_filter, emails))
+        return searches
+
+    def receive_notifications(
+        self, job: JobRunner, since_timestamp: datetime.datetime | None = None
+    ) -> Iterable[MaintenanceNotification]:
+        """
+        Retrieve emails since an specific time, if provided.
+        """
+        searches = asyncio.run(self._fetch_emails(self._get_filters(since_timestamp)))
+
+        received_notifications = []
+        for search_filter, emails in searches:
+            job.logger.debug(f'Fetched {len(emails)} emails from {self.name} source using filter: {search_filter}.')
+            for msg_id, content in emails:
+                raw_notification = self.process_email(job, email.message_from_bytes(content), msg_id)
+                if raw_notification:
+                    received_notifications.append(raw_notification)
+
+        job.logger.debug(f'Raw notifications created {len(received_notifications)} from {self.name}.')
         return received_notifications
 
 
