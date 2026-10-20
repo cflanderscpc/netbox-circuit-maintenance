@@ -254,6 +254,10 @@ class NotificationSource(NetBoxModel):
         ordering = ['name']
         verbose_name = _('notification source')
         verbose_name_plural = _('notification sources')
+        # Run now: a run fetches from every source, so the permission isn't checked against a source
+        permissions = [
+            ('fetch', 'Fetch notifications from all sources and update circuit maintenances'),
+        ]
 
     def __str__(self):
         return self.name

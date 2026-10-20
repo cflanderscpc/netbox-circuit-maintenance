@@ -1,0 +1,26 @@
+{% extends 'generic/_base.html' %}
+{% load form_helpers %}
+{% load i18n %}
+
+{% block title %}{{ job_name }}{% endblock %}
+
+{% block subtitle %}
+  <div class="text-secondary fs-5">
+    {% trans "Fetch notifications from every notification source and create or update circuit maintenances accordingly." %}
+  </div>
+{% endblock subtitle %}
+
+{% block content %}
+  <form action="" method="post" class="object-edit mt-5">
+    {% csrf_token %}
+    <div class="field-group my-5">
+      {% render_field form.dry_run %}
+    </div>
+    <div class="text-end">
+      <a href="{{ return_url }}" class="btn btn-outline-secondary">{% trans "Cancel" %}</a>
+      <button type="submit" class="btn btn-primary">
+        <i class="mdi mdi-play" aria-hidden="true"></i> {% trans "Run Now" %}
+      </button>
+    </div>
+  </form>
+{% endblock content %}

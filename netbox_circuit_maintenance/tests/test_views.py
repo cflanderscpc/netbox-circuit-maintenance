@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -12,7 +13,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 from circuits.models import Circuit, CircuitTermination, CircuitType, Provider
-from core.models import ObjectChange, ObjectType
+from core.choices import JobNotificationChoices, JobStatusChoices
+from core.models import Job, ObjectChange, ObjectType
 from dcim.models import (
     Cable,
     Device,
@@ -34,10 +36,12 @@ from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
 from netbox.context_managers import event_tracking
+from netbox.registry import registry
 from users.models import ObjectPermission
 from utilities.testing import ModelViewTestCase, ViewTestCases, create_tags, post_data
 
 from netbox_circuit_maintenance.choices import CircuitImpactChoices, CircuitMaintenanceStatusChoices, NoteLevelChoices
+from netbox_circuit_maintenance.handle_notifications.handler import HandleCircuitMaintenanceNotifications
 from netbox_circuit_maintenance.handle_notifications.sources import IMAP
 from netbox_circuit_maintenance.models import (
     CircuitImpact,
@@ -920,7 +924,8 @@ class NotificationSourceTestCase(
         self.assertEqual([str(source) for source in response.context['table'].data], ['Source 2'])
 
     def test_list_objects_actions(self):
-        # Export only: sources can't be added or imported, and have no bulk edit or bulk delete
+        # Sources can't be added or imported, and have no bulk edit or bulk delete. Run Now needs its own permission
+        # (NotificationSourceFetchTestCase)
         self.add_permissions(
             'netbox_circuit_maintenance.view_notificationsource',
             'netbox_circuit_maintenance.add_notificationsource',
@@ -1404,6 +1409,181 @@ class NotificationSourceGoogleOAuthTestCase(GmailSourcesMixin, PluginViewTestMix
         self.assertHttpStatus(response, 404)
         token_request.assert_not_called()
         self.assertIsNone(self.get_token())
+
+
+class NotificationSourceFetchTestCase(PluginViewTestMixin, ModelViewTestCase):
+    """
+    Run now, which Nautobot's tests didn't cover: its run_job redirected to the job's run form.
+    """
+
+    model = NotificationSource
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch('netbox_circuit_maintenance.views.any_workers_for_queue', return_value=True)
+        self.any_workers_for_queue = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_now(self, data=None, query=''):
+        """
+        Post the Run now form, and return the response and the RQ calls it queued: TestCase doesn't run on_commit
+        callbacks, so nothing reaches Redis.
+        """
+        with self.captureOnCommitCallbacks() as callbacks:
+            response = self.client.post(f'{self._get_url("fetch")}{query}', data or {})
+        return response, callbacks
+
+    def test_permission_registered(self):
+        # NetBox registers the model's Meta.permissions, so the ObjectPermission form offers the action
+        actions = registry['model_actions']['netbox_circuit_maintenance.notificationsource']
+        self.assertEqual(
+            {action.name: str(action.help_text) for action in actions},
+            {'fetch': 'Fetch notifications from all sources and update circuit maintenances'},
+        )
+
+    def test_get_form(self):
+        url = self._get_url('fetch')
+        self.assertHttpStatus(self.client.get(url), 403)
+        # Viewing sources isn't enough
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        self.assertHttpStatus(self.client.get(url), 403)
+
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Update Circuit Maintenances')
+        self.assertContains(response, 'name="dry_run"')
+        self.assertFalse(response.context['form']['dry_run'].value())
+        self.assertContains(
+            response, f'<a href="{self._get_url("list")}" class="btn btn-outline-secondary">Cancel</a>', html=True
+        )
+        self.assertFalse(Job.objects.exists())
+
+    def test_run_now(self):
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+
+        response, callbacks = self.run_now()
+
+        job = Job.objects.get()
+        # The user can't view jobs, so back to the sources
+        self.assertRedirects(response, self._get_url('list'), fetch_redirect_response=False)
+        self.assertEqual(
+            get_message_list(response), [(SUCCESS, f'Queued job #{job.pk} to update circuit maintenances.')]
+        )
+        self.assertRegex(job.name, r'^Update Circuit Maintenances - [0-9a-f]{8}$')
+        # The run records its changes as the user, who gets NetBox's notification when it ends
+        self.assertEqual(job.user, self.user)
+        self.assertEqual(job.notifications, JobNotificationChoices.NOTIFICATION_ALWAYS)
+        self.assertEqual((job.status, job.interval, job.object_type), (JobStatusChoices.STATUS_PENDING, None, None))
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0].args, (HandleCircuitMaintenanceNotifications.handle,))
+        self.assertEqual(callbacks[0].keywords['job'], job)
+        self.assertIs(callbacks[0].keywords['dry_run'], False)
+        self.any_workers_for_queue.assert_called_once_with('default')
+
+    def test_run_now_dry_run(self):
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+
+        response, callbacks = self.run_now({'dry_run': 'on'})
+        self.assertHttpStatus(response, 302)
+        self.assertIs(callbacks[0].keywords['dry_run'], True)
+
+        # The worker's call reaches run()
+        job = callbacks[0].keywords['job']
+        logger = logging.getLogger(f'netbox.jobs.{HandleCircuitMaintenanceNotifications.__name__}')
+        self.addCleanup(
+            lambda: [logger.removeHandler(h) for h in list(logger.handlers) if getattr(h, 'job', None) is job]
+        )
+        HandleCircuitMaintenanceNotifications.handle(job, dry_run=callbacks[0].keywords['dry_run'])
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatusChoices.STATUS_COMPLETED)
+        self.assertEqual(job.data, {'dry_run': True, 'raw_notifications': []})
+
+    def test_run_now_job_page(self):
+        # A user who can view the job goes to its page, which has its data and a Log tab
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource', 'core.view_job')
+
+        response, _ = self.run_now()
+        self.assertRedirects(response, Job.objects.get().get_absolute_url())
+
+    def test_run_now_job_page_constrained(self):
+        # Permission to view only other jobs leads back to the sources
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+        obj_perm = ObjectPermission(name='Test permission', constraints={'name': 'Other job'}, actions=['view'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Job))
+
+        response, _ = self.run_now()
+        self.assertRedirects(response, self._get_url('list'), fetch_redirect_response=False)
+
+    def test_run_now_return_url(self):
+        url = self._get_url('fetch')
+        raw_notifications_url = reverse('plugins:netbox_circuit_maintenance:rawnotification_list')
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+
+        response = self.client.get(f'{url}?return_url={raw_notifications_url}')
+        self.assertContains(
+            response, f'<a href="{raw_notifications_url}" class="btn btn-outline-secondary">Cancel</a>', html=True
+        )
+        response, _ = self.run_now(query=f'?return_url={raw_notifications_url}')
+        self.assertRedirects(response, raw_notifications_url, fetch_redirect_response=False)
+        # Only to this site's pages
+        response, _ = self.run_now(query='?return_url=https://example.com/')
+        self.assertRedirects(response, self._get_url('list'), fetch_redirect_response=False)
+
+    def test_run_now_names(self):
+        # Each run has a name of its own. When the RQ worker starts, it schedules job_interval's runs with
+        # enqueue_once(), which deletes a queued job under the handler's name and schedules a second series
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+        self.run_now()
+        self.run_now()
+        runs = list(Job.objects.all())
+        self.assertEqual(len({job.name for job in runs}), 2)
+
+        HandleCircuitMaintenanceNotifications.enqueue_once(interval=60)
+        self.assertQuerySetEqual(Job.objects.filter(pk__in=[job.pk for job in runs]), runs, ordered=False)
+        self.assertEqual(Job.objects.filter(name=HandleCircuitMaintenanceNotifications.name).count(), 1)
+
+    def test_run_now_no_worker(self):
+        # As NetBox's script form
+        self.any_workers_for_queue.return_value = False
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+
+        response, callbacks = self.run_now()
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(get_message_list(response), [(ERROR, 'Unable to run: RQ worker process not running.')])
+        self.assertFalse(Job.objects.exists())
+        self.assertEqual(callbacks, [])
+
+    def test_run_now_permissions(self):
+        response, _ = self.run_now()
+        self.assertHttpStatus(response, 403)
+        self.assertFalse(Job.objects.exists())
+
+        # Checked for the model, as a run fetches from every source: a permission's constraints don't narrow it
+        obj_perm = ObjectPermission(name='Test permission', constraints={'name': 'Source 2'}, actions=['fetch'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(NotificationSource))
+        response, _ = self.run_now()
+        self.assertHttpStatus(response, 302)
+        self.assertTrue(Job.objects.exists())
+
+    def test_list_objects_button(self):
+        list_url = self._get_url('list')
+        run_now_button = (
+            f'<a href="{self._get_url("fetch")}" class="btn btn-primary" role="button">'
+            '<i class="mdi mdi-play" aria-hidden="true"></i> Run Now</a>'
+        )
+        self.add_permissions('netbox_circuit_maintenance.view_notificationsource')
+        response = self.client.get(list_url)
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, run_now_button, html=True)
+
+        self.add_permissions('netbox_circuit_maintenance.fetch_notificationsource')
+        response = self.client.get(list_url)
+        self.assertContains(response, run_now_button, html=True)
 
 
 class RawNotificationTestCase(

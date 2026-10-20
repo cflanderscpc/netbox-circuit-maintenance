@@ -2,6 +2,7 @@ from circuits.models import Provider
 from core.models import ObjectChange
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection
+from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
 from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
@@ -268,9 +269,9 @@ class SyncNotificationSourcesTestCase(TestCase):
     def test_unapplied_migrations(self):
         # Before migrate finishes, the current models may not match the database
         NotificationSource.objects.create(name='Source 1')
-        MigrationRecorder(connection).migration_qs.filter(
-            app='netbox_circuit_maintenance', name='0009_provider_custom_fields'
-        ).delete()
+        # The plugin's latest migration: an earlier one with a later one applied isn't planned again
+        [(app_label, name)] = MigrationLoader(connection).graph.leaf_nodes('netbox_circuit_maintenance')
+        MigrationRecorder(connection).migration_qs.filter(app=app_label, name=name).delete()
         with self.assertRaisesMessage(NotificationSourceSyncError, 'The database has 1 unapplied migration(s).'):
             self.sync({'name': 'Source 2'})
         self.assertSources([('Source 1', False, [])])

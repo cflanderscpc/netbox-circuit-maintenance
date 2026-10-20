@@ -41,6 +41,7 @@ __all__ = (
     'NoteFilterForm',
     'NoteForm',
     'NoteImportForm',
+    'NotificationSourceFetchForm',
     'NotificationSourceFilterForm',
     'NotificationSourceForm',
     'RawNotificationFilterForm',
@@ -342,6 +343,20 @@ class NotificationSourceFilterForm(NetBoxModelFilterSetForm):
     model = NotificationSource
     fieldsets = (FieldSet('q', 'filter_id', 'tag'),)
     tag = TagFilterField(model)
+
+
+class NotificationSourceFetchForm(forms.Form):
+    """
+    Run now: the notification handler's arguments.
+    """
+
+    dry_run = forms.BooleanField(
+        label=_('Dry run'),
+        required=False,
+        help_text=_(
+            'Process the notifications without storing them, updating circuit maintenances or changing the mailboxes'
+        ),
+    )
 
 
 #

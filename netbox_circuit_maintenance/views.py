@@ -1,6 +1,7 @@
 import datetime
 import itertools
 import json
+import secrets
 from collections import defaultdict
 
 import requests
@@ -16,6 +17,7 @@ from django.utils.translation import gettext_lazy as _
 from django.views.generic import View
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
 from google_auth_oauthlib.flow import Flow
+from netbox.constants import RQ_QUEUE_DEFAULT
 from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport, DeleteObject, EditObject
 from netbox.plugins import get_plugin_config
 from netbox.ui import actions, layout
@@ -24,12 +26,14 @@ from netbox.views import generic
 from netbox.views.generic.base import BaseObjectView
 from oauthlib.oauth2 import OAuth2Error
 from utilities.permissions import get_permission_for_model
+from utilities.rqworker import any_workers_for_queue
 from utilities.views import GetReturnURLMixin, ObjectPermissionRequiredMixin, get_action_url, register_model_view
 
 from . import filtersets, forms, tables
+from .handle_notifications.handler import HandleCircuitMaintenanceNotifications
 from .handle_notifications.sources import GmailAPIOauth, RedirectAuthorize, Source
 from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
-from .object_actions import ValidateSource
+from .object_actions import RunNow, ValidateSource
 from .ui import panels
 
 #
@@ -278,7 +282,7 @@ class NotificationSourceListView(generic.ObjectListView):
     filterset = filtersets.NotificationSourceFilterSet
     filterset_form = forms.NotificationSourceFilterForm
     table = tables.NotificationSourceTable
-    actions = (BulkExport,)
+    actions = (RunNow, BulkExport)
 
 
 @register_model_view(NotificationSource)
@@ -461,6 +465,54 @@ class NotificationSourceGoogleCallbackView(BaseObjectView):
         # Validate the new token, as Nautobot's callback did by redirecting to Validate
         validate_source(request, notification_source)
         return redirect(notification_source.get_absolute_url())
+
+
+@register_model_view(NotificationSource, 'fetch', detail=False)
+class NotificationSourceFetchView(GetReturnURLMixin, BaseObjectView):
+    """
+    Run now: queue a run of the notification handler, which fetches from every source and updates circuit maintenances.
+    The run records its changes as the requesting user. Nautobot's run_job redirected to the job's run form.
+    """
+
+    queryset = NotificationSource.objects.all()
+    template_name = 'netbox_circuit_maintenance/notificationsource_fetch.html'
+
+    def get_required_permission(self):
+        return get_permission_for_model(self.queryset.model, 'fetch')
+
+    def get(self, request):
+        return self.render_form(request, forms.NotificationSourceFetchForm())
+
+    def post(self, request):
+        form = forms.NotificationSourceFetchForm(request.POST)
+        # As NetBox's script form checks: without a worker, the job would wait unnoticed until one starts
+        if not any_workers_for_queue(RQ_QUEUE_DEFAULT):
+            messages.error(request, _('Unable to run: RQ worker process not running.'))
+        elif form.is_valid():
+            # Each run has a name of its own. When the RQ worker starts, it schedules job_interval's runs with
+            # enqueue_once(), which would delete a queued job under the handler's name
+            job = HandleCircuitMaintenanceNotifications.enqueue(
+                name=f'{HandleCircuitMaintenanceNotifications.name} - {secrets.token_hex(4)}',
+                user=request.user,
+                dry_run=form.cleaned_data['dry_run'],
+            )
+            messages.success(request, _('Queued job #{id} to update circuit maintenances.').format(id=job.pk))
+            # The job's page, which has its data and a Log tab
+            if request.user.has_perm('core.view_job', job):
+                return redirect(job.get_absolute_url())
+            return redirect(self.get_return_url(request))
+        return self.render_form(request, form)
+
+    def render_form(self, request, form):
+        return render(
+            request,
+            self.template_name,
+            {
+                'form': form,
+                'job_name': HandleCircuitMaintenanceNotifications.name,
+                'return_url': self.get_return_url(request),
+            },
+        )
 
 
 #
