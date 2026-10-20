@@ -1,9 +1,11 @@
+import datetime
 import re
 
 from circuits.models import Provider
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
 from django.db.migrations.executor import MigrationExecutor
+from django.utils import timezone
 from netbox.plugins import get_plugin_config
 from utilities.exceptions import AbortRequest
 
@@ -11,10 +13,18 @@ from .models import NotificationSource
 
 __all__ = (
     'NotificationSourceSyncError',
+    'get_midnight',
     'markdown_code_span',
     'split_provider_emails',
     'sync_notification_sources',
 )
+
+
+def get_midnight(day):
+    """
+    Return local midnight at the start of the given date.
+    """
+    return timezone.make_aware(datetime.datetime.combine(day, datetime.time()))
 
 
 def markdown_code_span(text):

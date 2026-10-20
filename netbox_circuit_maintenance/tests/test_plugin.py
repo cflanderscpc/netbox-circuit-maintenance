@@ -18,6 +18,7 @@ class PluginTest(TestCase):
             'raw_notification_size': 8192,
             'dashboard_n_days': 30,
             'overlap_job_exclude_no_impact': False,
+            'overlap_job_interval': None,
             'job_interval': None,
             'job_user': None,
             'notification_sources': [],

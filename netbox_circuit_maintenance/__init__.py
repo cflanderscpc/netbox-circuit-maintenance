@@ -23,6 +23,8 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
         'raw_notification_size': 8192,
         'dashboard_n_days': 30,
         'overlap_job_exclude_no_impact': False,
+        # Minutes between scheduled runs of the site overlap job; None disables the schedule
+        'overlap_job_interval': None,
         # Minutes between scheduled runs of the notification handler job; None disables the schedule
         'job_interval': None,
         # Username that scheduled handler runs record their changes as; None means those runs record no change log
@@ -34,7 +36,8 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
     def ready(self):
         super().ready()
 
-        # Connect the signal receivers, and register the notification handler as a system job if job_interval is set
+        # Connect the signal receivers, and register the notification handler and the overlap job as system jobs if
+        # their interval settings are set
         from . import jobs, signals
 
         # The NotificationSource sync, for this plugin's post_migrate only

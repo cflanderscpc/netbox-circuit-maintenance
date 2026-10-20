@@ -1,0 +1,11 @@
+{% load i18n %}
+{# A run needs a user, and exempt view permissions show the list to anonymous users #}
+{% if request.user.is_authenticated %}
+  <form action="{{ url }}{% if url_params %}?{{ url_params.urlencode }}{% endif %}" method="post">
+    {% csrf_token %}
+    {# Nautobot's job description #}
+    <button type="submit" class="btn btn-primary" title="{% trans "Search for sites with overlapping circuit maintenances, assuming only two circuits per site" %}">
+      <i class="mdi mdi-calendar-alert" aria-hidden="true"></i> {{ label }}
+    </button>
+  </form>
+{% endif %}

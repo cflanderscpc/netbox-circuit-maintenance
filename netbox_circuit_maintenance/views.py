@@ -33,8 +33,10 @@ from . import filtersets, forms, tables
 from .handle_notifications.handler import HandleCircuitMaintenanceNotifications
 from .handle_notifications.sources import GmailAPIOauth, RedirectAuthorize, Source
 from .models import CircuitImpact, CircuitMaintenance, Note, NotificationSource, ParsedNotification, RawNotification
-from .object_actions import RunNow, ValidateSource
+from .object_actions import FindOverlaps, RunNow, ValidateSource
+from .site_search import FindSitesWithMaintenanceOverlap
 from .ui import panels
+from .utils import get_midnight
 
 #
 # CircuitMaintenance
@@ -48,6 +50,7 @@ class CircuitMaintenanceListView(generic.ObjectListView):
     filterset = filtersets.CircuitMaintenanceFilterSet
     filterset_form = forms.CircuitMaintenanceFilterForm
     table = tables.CircuitMaintenanceTable
+    actions = (AddObject, BulkImport, BulkExport, FindOverlaps, BulkEdit, BulkDelete)
 
 
 @register_model_view(CircuitMaintenance)
@@ -109,6 +112,54 @@ class CircuitMaintenanceView(generic.ObjectView):
             ),
         ],
     )
+
+
+@register_model_view(CircuitMaintenance, 'find_overlaps', path='find-overlaps', detail=False)
+class CircuitMaintenanceFindOverlapsView(GetReturnURLMixin, BaseObjectView):
+    """
+    Queue a run of the overlap job, which reports the sites where the maintenances the user can view overlap. Nautobot's
+    job was run from Nautobot's job list.
+    """
+
+    queryset = CircuitMaintenance.objects.all()
+
+    def get_required_permission(self):
+        return get_permission_for_model(self.queryset.model, 'view')
+
+    def get(self, request):
+        # Queueing creates a job, so it's a POST
+        return redirect(self.get_return_url(request))
+
+    def post(self, request):
+        # Exempt view permissions let anonymous users this far, but the run needs a user: without one it would cover
+        # every maintenance, circuit and site
+        if not request.user.is_authenticated:
+            return self.handle_no_permission()
+        # As NetBox's script form checks: without a worker, the job would wait unnoticed until one starts
+        if not any_workers_for_queue(RQ_QUEUE_DEFAULT):
+            messages.error(request, _('Unable to run: RQ worker process not running.'))
+            return redirect(self.get_return_url(request))
+
+        # Each run has a name of its own, as Run now's. When the RQ worker starts, it schedules overlap_job_interval's
+        # runs with enqueue_once(), which would delete a queued job under the job's name
+        job = FindSitesWithMaintenanceOverlap.enqueue(
+            name=f'{FindSitesWithMaintenanceOverlap.name} - {secrets.token_hex(4)}',
+            user=request.user,
+        )
+        messages.success(
+            request, _('Queued job #{id} to find sites with circuit maintenance overlap.').format(id=job.pk)
+        )
+        # The job's page, whose Log tab lists the overlaps
+        if request.user.has_perm('core.view_job', job):
+            return redirect(job.get_absolute_url())
+        # The job's log is all it produces
+        messages.warning(
+            request,
+            _("The overlaps will be in the log of job #{id}, which you don't have permission to view.").format(
+                id=job.pk
+            ),
+        )
+        return redirect(self.get_return_url(request))
 
 
 @register_model_view(CircuitMaintenance, 'add', detail=False)
@@ -602,13 +653,6 @@ class ParsedNotificationView(generic.ObjectView):
 #
 # Dashboard
 #
-
-
-def get_midnight(day):
-    """
-    Return local midnight at the start of the given date.
-    """
-    return timezone.make_aware(datetime.datetime.combine(day, datetime.time()))
 
 
 def get_date_range(day, days):

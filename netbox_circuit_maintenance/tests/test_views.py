@@ -1,10 +1,12 @@
 import base64
 import csv
 import hashlib
+import html
 import io
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from datetime import UTC, date, datetime, time, timedelta
@@ -28,7 +30,7 @@ from dcim.models import (
     Site,
 )
 from django.conf import settings
-from django.contrib.messages import ERROR, SUCCESS, get_messages
+from django.contrib.messages import ERROR, SUCCESS, WARNING, get_messages
 from django.test import RequestFactory, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -51,6 +53,7 @@ from netbox_circuit_maintenance.models import (
     ParsedNotification,
     RawNotification,
 )
+from netbox_circuit_maintenance.site_search import FindSitesWithMaintenanceOverlap
 from netbox_circuit_maintenance.views import GOOGLE_OAUTH_SESSION_KEY, CircuitMaintenanceOverviewView
 
 from .test_sources import (
@@ -396,6 +399,181 @@ class CircuitMaintenanceTestCase(PluginViewTestMixin, ViewTestCases.PrimaryObjec
         self.assertContains(
             response, f'<a href="{parsed_notification.get_absolute_url()}">{parsed_notification}</a>', html=True
         )
+
+
+class CircuitMaintenanceFindOverlapsTestCase(PluginViewTestMixin, ModelViewTestCase):
+    """
+    The Find Site Overlaps button, which queues the overlap job. Nautobot's job was run from Nautobot's job list.
+    """
+
+    model = CircuitMaintenance
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch('netbox_circuit_maintenance.views.any_workers_for_queue', return_value=True)
+        self.any_workers_for_queue = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def find_overlaps(self, query=''):
+        """
+        Post the button's form, and return the response and the RQ calls it queued: TestCase doesn't run on_commit
+        callbacks, so nothing reaches Redis.
+        """
+        with self.captureOnCommitCallbacks() as callbacks:
+            response = self.client.post(f'{self._get_url("find_overlaps")}{query}')
+        return response, callbacks
+
+    def test_find_overlaps(self):
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        response, callbacks = self.find_overlaps()
+
+        job = Job.objects.get()
+        # The user can't view jobs, so back to the maintenances, told where the results will be
+        self.assertRedirects(response, self._get_url('list'), fetch_redirect_response=False)
+        self.assertEqual(
+            get_message_list(response),
+            [
+                (SUCCESS, f'Queued job #{job.pk} to find sites with circuit maintenance overlap.'),
+                (
+                    WARNING,
+                    f"The overlaps will be in the log of job #{job.pk}, which you don't have permission to view.",
+                ),
+            ],
+        )
+        self.assertRegex(job.name, r'^Find Sites With Circuit Maintenance Overlap - [0-9a-f]{8}$')
+        # The run covers what the user can view, and the user gets NetBox's notification when it ends
+        self.assertEqual(job.user, self.user)
+        self.assertEqual(job.notifications, JobNotificationChoices.NOTIFICATION_ALWAYS)
+        self.assertEqual((job.status, job.interval, job.object_type), (JobStatusChoices.STATUS_PENDING, None, None))
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0].args, (FindSitesWithMaintenanceOverlap.handle,))
+        self.assertEqual(callbacks[0].keywords['job'], job)
+        self.any_workers_for_queue.assert_called_once_with('default')
+
+        # The worker's call reaches run(), which checks the maintenance the user can view
+        CircuitMaintenance.objects.create(name='UT-TEST-1', start_time=timezone.now(), end_time=timezone.now())
+        logger = logging.getLogger(f'netbox.jobs.{FindSitesWithMaintenanceOverlap.__name__}')
+        self.addCleanup(
+            lambda: [logger.removeHandler(h) for h in list(logger.handlers) if getattr(h, 'job', None) is job]
+        )
+        FindSitesWithMaintenanceOverlap.handle(job)
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatusChoices.STATUS_COMPLETED)
+        self.assertEqual(job.log_entries[-1]['message'], 'Successfully checked through 1 maintenance notification.')
+
+    def test_find_overlaps_job_page(self):
+        # A user who can view the job goes to its page, whose Log tab lists the overlaps
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance', 'core.view_job')
+
+        response, _ = self.find_overlaps()
+        job = Job.objects.get()
+        self.assertRedirects(response, job.get_absolute_url())
+        self.assertEqual(
+            get_message_list(response),
+            [(SUCCESS, f'Queued job #{job.pk} to find sites with circuit maintenance overlap.')],
+        )
+
+    def test_find_overlaps_get(self):
+        # Queueing creates a job, so a GET only leads back
+        url = self._get_url('find_overlaps')
+        self.assertHttpStatus(self.client.get(url), 403)
+
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+        self.assertRedirects(self.client.get(url), self._get_url('list'))
+        self.assertFalse(Job.objects.exists())
+
+    def test_find_overlaps_permissions(self):
+        response, callbacks = self.find_overlaps()
+        self.assertHttpStatus(response, 403)
+        self.assertFalse(Job.objects.exists())
+        self.assertEqual(callbacks, [])
+
+        # Checked for the model: the run covers the maintenances the user can view, whatever the constraints
+        obj_perm = ObjectPermission(name='Test permission', constraints={'name': 'UT-TEST-1'}, actions=['view'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(CircuitMaintenance))
+        response, _ = self.find_overlaps()
+        self.assertHttpStatus(response, 302)
+        self.assertTrue(Job.objects.exists())
+
+    @override_settings(LOGIN_REQUIRED=False, EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_find_overlaps_anonymous(self):
+        # Exempt view permissions let anonymous users see the list, but a run needs a user: without one it would cover
+        # everything. They're sent to log in, and don't see the button
+        self.client.logout()
+
+        response, callbacks = self.find_overlaps()
+        self.assertRedirects(
+            response, f'{settings.LOGIN_URL}?next={self._get_url("find_overlaps")}', fetch_redirect_response=False
+        )
+        self.assertFalse(Job.objects.exists())
+        self.assertEqual(callbacks, [])
+
+        response = self.client.get(self._get_url('list'))
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, 'Find Site Overlaps')
+
+    def test_find_overlaps_return_url(self):
+        dashboard_url = self._get_url('overview')
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        response, _ = self.find_overlaps(query=f'?return_url={dashboard_url}')
+        self.assertRedirects(response, dashboard_url, fetch_redirect_response=False)
+        # Only to this site's pages
+        response, _ = self.find_overlaps(query='?return_url=https://example.com/')
+        self.assertRedirects(response, self._get_url('list'), fetch_redirect_response=False)
+
+    def test_find_overlaps_names(self):
+        # Each run has a name of its own. When the RQ worker starts, it schedules overlap_job_interval's runs with
+        # enqueue_once(), which deletes a queued job under the job's name and schedules a second series
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+        self.find_overlaps()
+        self.find_overlaps()
+        runs = list(Job.objects.all())
+        self.assertEqual(len({job.name for job in runs}), 2)
+
+        FindSitesWithMaintenanceOverlap.enqueue_once(interval=60)
+        self.assertQuerySetEqual(Job.objects.filter(pk__in=[job.pk for job in runs]), runs, ordered=False)
+        self.assertEqual(Job.objects.filter(name=FindSitesWithMaintenanceOverlap.name).count(), 1)
+
+    def test_find_overlaps_no_worker(self):
+        # As NetBox's script form
+        self.any_workers_for_queue.return_value = False
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+
+        response, callbacks = self.find_overlaps()
+        self.assertRedirects(response, self._get_url('list'), fetch_redirect_response=False)
+        self.assertEqual(get_message_list(response), [(ERROR, 'Unable to run: RQ worker process not running.')])
+        self.assertFalse(Job.objects.exists())
+        self.assertEqual(callbacks, [])
+
+    def test_list_objects_button(self):
+        self.add_permissions('netbox_circuit_maintenance.view_circuitmaintenance')
+        filtered_list_url = f'{self._get_url("list")}?status=CONFIRMED&q=UT'
+
+        response = self.client.get(filtered_list_url)
+        self.assertHttpStatus(response, 200)
+        # Nautobot's job description as a tooltip
+        self.assertContains(
+            response,
+            '<button type="submit" class="btn btn-primary" title="Search for sites with overlapping circuit '
+            'maintenances, assuming only two circuits per site"><i class="mdi mdi-calendar-alert" aria-hidden="true">'
+            '</i> Find Site Overlaps</button>',
+            html=True,
+        )
+        # A form posting the CSRF token
+        match = re.search(
+            r'<form action="([^"]+)" method="post">\s*<input type="hidden" name="csrfmiddlewaretoken" value="\w+">\s*'
+            r'<button type="submit" class="btn btn-primary" title="Search for sites',
+            response.content.decode(),
+        )
+        self.assertIsNotNone(match)
+        # A run covers every maintenance the user can view, so the list's filters don't go with it, only the way back
+        action = urlsplit(html.unescape(match[1]))
+        self.assertEqual(action.path, self._get_url('find_overlaps'))
+        self.assertEqual(parse_qs(action.query), {'return_url': [filtered_list_url]})
 
 
 class CircuitImpactTestCase(PluginViewTestMixin, ViewTestCases.OrganizationalObjectViewTestCase):
