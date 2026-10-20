@@ -7,10 +7,12 @@ from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 from extras.models import Bookmark, JournalEntry, Notification, Subscription, Tag
 from users.models import User
+from utilities.templatetags.builtins.filters import render_markdown
 
 from netbox_circuit_maintenance.models import NotificationSource, RawNotification
 from netbox_circuit_maintenance.utils import (
     NotificationSourceSyncError,
+    markdown_code_span,
     split_provider_emails,
     sync_notification_sources,
 )
@@ -38,6 +40,36 @@ class SplitProviderEmailsTestCase(SimpleTestCase):
         for value in (None, 123, ['noc@x.com'], {'email': 'noc@x.com'}):
             with self.subTest(value=value):
                 self.assertEqual(split_provider_emails(value), [])
+
+
+class MarkdownCodeSpanTestCase(SimpleTestCase):
+    def test_code_span(self):
+        for text, span in (
+            ('ABC-1', '` ABC-1 `'),
+            ('A`B', '`` A`B ``'),
+            ('``A`', '``` ``A` ```'),
+            ('', '`  `'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(markdown_code_span(text), span)
+
+    def test_rendered(self):
+        # NetBox's Markdown rendering shows the text verbatim, HTML and Markdown syntax included
+        for text, html in (
+            ('<ABC-1>', '&lt;ABC-1&gt;'),
+            ('A*B*C', 'A*B*C'),
+            ('_X_', '_X_'),
+            ('A`B', 'A`B'),
+            ('`A', '`A'),
+            ('A``', 'A``'),
+            ('A\\', 'A\\'),
+            ('[x](javascript:alert(1))', '[x](javascript:alert(1))'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    render_markdown(markdown_code_span(text)),
+                    f'<div class="rendered-markdown"><p><code>{html}</code></p></div>',
+                )
 
 
 class SyncNotificationSourcesTestCase(TestCase):

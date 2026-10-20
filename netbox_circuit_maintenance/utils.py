@@ -1,3 +1,5 @@
+import re
+
 from circuits.models import Provider
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
@@ -9,9 +11,21 @@ from .models import NotificationSource
 
 __all__ = (
     'NotificationSourceSyncError',
+    'markdown_code_span',
     'split_provider_emails',
     'sync_notification_sources',
 )
+
+
+def markdown_code_span(text):
+    """
+    Return the text as a Markdown inline code span, for text the plugin writes into a Markdown field that mustn't
+    render as Markdown (a provider's circuit ID, say). The delimiter is one backtick longer than the longest run of
+    backticks in the text, and the space inside each end, which Markdown strips, keeps a backtick at either end of the
+    text off the delimiter.
+    """
+    delimiter = '`' * (max(map(len, re.findall('`+', text)), default=0) + 1)
+    return f'{delimiter} {text} {delimiter}'
 
 
 def split_provider_emails(value):

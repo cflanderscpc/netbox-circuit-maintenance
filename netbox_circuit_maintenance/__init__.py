@@ -34,8 +34,8 @@ class NetBoxCircuitMaintenanceConfig(PluginConfig):
     def ready(self):
         super().ready()
 
-        # Connect the signal receivers
-        from . import signals
+        # Connect the signal receivers, and register the notification handler as a system job if job_interval is set
+        from . import jobs, signals
 
         # The NotificationSource sync, for this plugin's post_migrate only
         post_migrate.connect(signals.import_notification_sources, sender=self)

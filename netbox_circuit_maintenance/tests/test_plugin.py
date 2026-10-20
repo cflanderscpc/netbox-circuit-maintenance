@@ -1,3 +1,4 @@
+import sys
 from importlib import metadata
 
 from django.apps import apps
@@ -29,6 +30,11 @@ class PluginTest(TestCase):
             self.assertIn(setting, settings.PLUGINS_CONFIG['netbox_circuit_maintenance'])
 
     @override_settings(ISOLATED_DEPLOYMENT=True)  # Don't fetch the online plugin catalog
+    def test_ready_imports_jobs(self):
+        # ready() imports jobs, which registers the system job. No test module imports it (test_handler runs it with
+        # runpy), so this fails if ready() stops importing it
+        self.assertIn('netbox_circuit_maintenance.jobs', sys.modules)
+
     def test_plugin_list(self):
         self.user.is_superuser = True
         self.user.save()

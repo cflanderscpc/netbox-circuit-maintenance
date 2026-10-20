@@ -911,7 +911,7 @@ class GmailAPIServiceAccount(GmailAPI):
 def get_notifications(
     job: JobRunner,
     notification_sources: Iterable[NotificationSource],
-    since: int,
+    since: float,
     dry_run: bool = False,
 ) -> Iterable[MaintenanceNotification]:
     """
